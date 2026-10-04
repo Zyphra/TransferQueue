@@ -30,7 +30,7 @@ from transfer_queue import interface
 @pytest.fixture(scope="module")
 def owned_ray():
     assert not ray.is_initialized()
-    ray.init(num_cpus=4, num_gpus=0, object_store_memory=256 * 1024 * 1024)
+    ray.init(address="local", num_cpus=4, num_gpus=0, object_store_memory=256 * 1024 * 1024)
     yield
     ray.shutdown()
 
@@ -98,6 +98,7 @@ def physical_state(path):
 def test_mixed_snapshot_prunes_exact_fields_and_indexes(services, tmp_path, monkeypatch):
     put("promptless-reader", partition="other-consumer", value=7)
     put("finished", value=2)
+    put("field-owner", field="late-field", value=9)
     put("validation", partition="val", value=3)
     controller = interface._TQ_CONTROLLER
     ray.get(controller.create_partition.remote("index-only"))
@@ -111,9 +112,9 @@ def test_mixed_snapshot_prunes_exact_fields_and_indexes(services, tmp_path, monk
     with (path / "controller_state.pkl").open("rb") as f:
         saved = pickle.load(f)
     fresh_restore(services, path)
-    assert tq.kv_batch_get(keys=["promptless-reader"], partition_id="other-consumer")["value"].item() == 7
-    assert tq.kv_batch_get(keys=["validation"], partition_id="val")["value"].item() == 3
-    assert tq.kv_batch_get(keys=["finished"], partition_id="train")["value"].item() == 2
+    assert tq.kv_batch_get(keys=["promptless-reader"], partition_id="other-consumer")["value"].unbind()[0].item() == 7
+    assert tq.kv_batch_get(keys=["validation"], partition_id="val")["value"].unbind()[0].item() == 3
+    assert tq.kv_batch_get(keys=["finished"], partition_id="train")["value"].unbind()[0].item() == 2
     states = physical_state(tmp_path / "restored")
     for position, state in enumerate(states):
         expected = {}
@@ -127,7 +128,9 @@ def test_mixed_snapshot_prunes_exact_fields_and_indexes(services, tmp_path, monk
     put("fresh", value=4)
     for state in physical_state(tmp_path / "reallocated"):
         assert "old-only" not in state["field_data"]
-        assert "late-field" not in state["field_data"]
+        values = state["field_data"].get("late-field", {})
+        expected_indexes = saved["partitions"]["train"].field_metadata["late-field"].global_indexes
+        assert set(values).issubset(expected_indexes)
 
 
 def test_missing_produced_field_refuses_fresh_restore(services, tmp_path, monkeypatch):
@@ -148,7 +151,7 @@ def test_reused_index_and_empty_field_mapping_restore(services, tmp_path):
     path = tmp_path / "checkpoint"
     tq.save_checkpoint(path)
     fresh_restore(services, path)
-    assert tq.kv_batch_get(keys=["new"], partition_id="train")["value"].item() == 5
+    assert tq.kv_batch_get(keys=["new"], partition_id="train")["value"].unbind()[0].item() == 5
 
 
 @pytest.mark.parametrize("positions", [[0, 0], [-1, 1]])
@@ -213,7 +216,7 @@ async def test_cancelled_load_waits_through_repeated_cancellation(services, tmp_
     tq.save_checkpoint(path)
     manager = interface._maybe_create_tq_client().storage_manager
     original = manager._load_single_storage_unit
-    entered, release = asyncio.Event(), asyncio.Event()
+    entered, release, abandoned = asyncio.Event(), asyncio.Event(), asyncio.Event()
     completed = 0
 
     async def held(*args, **kwargs):
@@ -222,7 +225,11 @@ async def test_cancelled_load_waits_through_repeated_cancellation(services, tmp_
         completed += 1
         if completed == 2:
             entered.set()
-        await release.wait()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            abandoned.set()
+            raise
         return result
 
     monkeypatch.setattr(manager, "_load_single_storage_unit", held)
@@ -231,7 +238,8 @@ async def test_cancelled_load_waits_through_repeated_cancellation(services, tmp_
         await asyncio.wait_for(entered.wait(), 30)
         for _ in range(2):
             load.cancel()
-            await asyncio.sleep(0)
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(abandoned.wait(), 0.05)
             assert not load.done(), "Cancellation abandoned admitted shard operations"
     finally:
         release.set()
@@ -253,3 +261,18 @@ def test_wrongly_routed_produced_payload_refuses_restore(services, tmp_path):
     tq.init(services)
     with pytest.raises(RuntimeError, match="Missing produced checkpoint payload"):
         tq.load_checkpoint(path)
+
+
+def test_unproduced_clearing_field_may_be_absent(services, tmp_path):
+    put("clearing")
+    client = interface._maybe_create_tq_client()
+    meta = client.kv_retrieve_meta(keys=["clearing"], partition_id="train", create=False)
+    ray.get(interface._TQ_CONTROLLER.mark_clearing.remote(meta.global_indexes, meta.partition_ids))
+    client._run_coroutine(client.storage_manager.clear_data(meta))
+    path = tmp_path / "checkpoint"
+    tq.save_checkpoint(path)
+    fresh_restore(services, path)
+    snapshot = ray.get(interface._TQ_CONTROLLER.get_partition_snapshot.remote("train"))
+    assert "clearing" in snapshot.keys_mapping
+    assert not snapshot.production_status.any()
+    assert all(not state["field_data"] and not state["active_keys"] for state in physical_state(tmp_path / "empty"))
