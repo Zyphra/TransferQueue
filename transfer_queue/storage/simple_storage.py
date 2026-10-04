@@ -614,14 +614,26 @@ class SimpleStorageUnit:
                     f"[{self.storage_unit_id}]: overwriting {len(self.storage_data._active_keys)} "
                     f"existing keys with checkpoint data from {path}"
                 )
-            self.storage_data.field_data.clear()
-            self.storage_data._active_keys.clear()
-            self.storage_data.field_data = data["field_data"]
-            self.storage_data._active_keys = data["active_keys"]
+            expected_fields = data_parts.body.get("expected_fields")
+            candidate = data["field_data"] if expected_fields is None else {}
+            for field_name, indexes in (expected_fields or {}).items():
+                values = data["field_data"].get(field_name, {})
+                for index, (partition, key, required) in indexes.items():
+                    if required and index not in values:
+                        raise ValueError(
+                            f"Missing produced checkpoint payload: partition={partition!r}, key={key!r}, "
+                            f"index={index}, field={field_name!r}"
+                        )
+                retained = {index: value for index, value in values.items() if index in indexes}
+                if retained:
+                    candidate[field_name] = retained
+            active_keys = set().union(*(values.keys() for values in candidate.values()))
+            self.storage_data.field_data = candidate
+            self.storage_data._active_keys = active_keys
 
             logger.info(
                 f"[{self.storage_unit_id}]: loaded checkpoint from {path} — "
-                f"{len(data['active_keys'])} keys, {len(data['field_data'])} fields"
+                f"{len(active_keys)} keys, {len(candidate)} fields"
             )
             return ZMQMessage.create(
                 request_type=ZMQRequestType.LOAD_STORAGE_CHECKPOINT_RESPONSE,  # type: ignore[arg-type]

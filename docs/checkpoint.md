@@ -123,7 +123,7 @@ tq.save_checkpoint / tq.load_checkpoint
                               └── ...
 ```
 
-Both the controller and each storage unit write their data directly to disk from within their own processes. The ZMQ RPC carries only the target file path and an ACK, not the payload — this avoids routing large tensors through the Ray object store.
+Both the controller and each storage unit write their data directly to disk from within their own processes. The ZMQ RPC carries the target file path, restore ownership metadata and an ACK, not the payload — this avoids routing large tensors through the Ray object store.
 
 ## Save Order and Consistency
 
@@ -142,6 +142,8 @@ If storage were snapshotted first, a race could produce a checkpoint where the c
 ## Storage Unit Count Matching
 
 On load, the number of storage units in the checkpoint must exactly match the running system. The matching is by **position** (index in the ordered list), not by storage unit ID — since IDs are regenerated on each `tq.init()`, position-based matching supports restart with freshly created actors. A count mismatch raises `ValueError` and aborts the restore.
+
+On full SimpleStorage restore, the saved controller metadata determines field/index ownership. Each shard validates every produced field on its modulo-selected position, removes storage-only fields and indexes, and recomputes active-key accounting before replacing its data. Preallocated rows need no payload; fields that are not produced may be absent. A missing produced field refuses restore with its partition, key, index and field. This does not make concurrent overwrites or clears during save coherent; callers still own snapshot admission.
 
 ## Known Limitations
 
@@ -163,6 +165,6 @@ if meta.get("storage_saved"):
 client.load_controller_checkpoint(...)    # (2) controller restored second
 ```
 
-If step (1) partially succeeds and step (2) fails, the system is left in a mixed state: some storage units hold checkpoint data while the controller still reflects its pre-restore state. There is no rollback path.
+All admitted shard loads settle before returning, including on failure or caller cancellation. If step (1) partially succeeds or step (2) fails, the system is left in a mixed state: some storage units hold checkpoint data while the controller still reflects its pre-restore state. There is no rollback path.
 
-**Workaround**: If `load_checkpoint` raises, call `tq.init()` again to reset the system to a clean state before retrying.
+**Workaround**: If `load_checkpoint` raises, stop consumers/producers, close the owned system with `tq.close()`, and create fresh services with `tq.init()` before retrying. Do not continue using partially restored services.
