@@ -17,7 +17,7 @@ import asyncio
 import os
 import warnings
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping, Sequence
 from operator import itemgetter
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
@@ -55,6 +55,37 @@ with_storage_unit_socket = with_zmq_socket(
     resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
     timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT,
 )
+
+
+async def _settle_storage_operations(operations: Sequence[Awaitable[Any]]) -> None:
+    """Keep shard RPCs owned until all settle, including through caller cancellation."""
+    first_error: BaseException | None = None
+
+    async def settle(operation: Awaitable[Any]) -> Any:
+        nonlocal first_error
+        try:
+            return await operation
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+            return error
+
+    completion = asyncio.gather(*(settle(operation) for operation in operations))
+    while not completion.done():
+        try:
+            await asyncio.shield(completion)
+        except asyncio.CancelledError as error:
+            if first_error is None:
+                first_error = error
+
+    results = completion.result()
+    if first_error is not None:
+        for result in results:
+            if isinstance(result, BaseException) and result is not first_error:
+                logger.error(
+                    "Additional storage operation failure", exc_info=(type(result), result, result.__traceback__)
+                )
+        raise first_error
 
 
 class RoutingGroup(NamedTuple):
@@ -267,7 +298,7 @@ class AsyncSimpleStorageManager(StorageManager):
         ]
 
         try:
-            await asyncio.gather(*tasks)
+            await _settle_storage_operations(tasks)
         except Exception as e:
             logger.error(
                 f"[{self.storage_manager_id}]: put_data failed. "
@@ -498,11 +529,7 @@ class AsyncSimpleStorageManager(StorageManager):
             for su_id, group in routing.items()
         ]
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error(f"[{self.storage_manager_id}]: Error in clear operation task {i}: {result}")
+        await _settle_storage_operations(tasks)
 
     @with_storage_unit_socket
     async def _clear_single_storage_unit(self, global_indexes, target_storage_unit=None, socket=None):
