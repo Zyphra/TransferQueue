@@ -229,9 +229,8 @@ async def test_async_storage_manager_error_handling():
         with pytest.raises(RuntimeError, match="Mock GET error"):
             await manager.get_data(batch_meta)
 
-        # Note: clear_data uses return_exceptions=True, so it doesn't raise exceptions directly
-        # Instead, we can verify that the clear operation was attempted
-        await manager.clear_data(batch_meta)  # Should not raise due to return_exceptions=True
+        with pytest.raises(RuntimeError, match="Mock CLEAR error"):
+            await manager.clear_data(batch_meta)
 
 
 @pytest.mark.asyncio
