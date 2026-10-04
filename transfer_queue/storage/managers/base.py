@@ -591,8 +591,12 @@ class KVStorageManager(StorageManager):
     def _get_executor(self) -> ThreadPoolExecutor:
         """Lazy Creating multi-thread executor for speeding up '_merge_tensors_to_tensordict'"""
         if self._multi_threads_executor is None:
-            ray_context = ray.get_runtime_context()
-            is_in_ray_actor_or_task = ray_context.get_actor_id() is not None or ray_context.get_task_id() is not None
+            is_in_ray_actor_or_task = False
+            if ray.is_initialized():
+                ray_context = ray.get_runtime_context()
+                is_in_ray_actor_or_task = (
+                    ray_context.get_actor_id() is not None or ray_context.get_task_id() is not None
+                )
 
             if is_in_ray_actor_or_task:
                 # In ray actor:
