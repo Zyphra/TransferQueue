@@ -114,7 +114,9 @@ BACKEND_CONFIGS = {
 @pytest.fixture(scope="module")
 def ray_cluster():
     if not ray.is_initialized():
-        ray.init(ignore_reinit_error=True)
+        ray.init(
+            address="local", num_cpus=4, num_gpus=0, object_store_memory=256 * 1024 * 1024, ignore_reinit_error=True
+        )
     yield
     if ray.is_initialized():
         ray.shutdown()

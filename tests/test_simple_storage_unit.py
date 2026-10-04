@@ -90,7 +90,7 @@ class MockStorageClient:
 @pytest.fixture(scope="session")
 def ray_setup():
     """Initialize Ray for testing."""
-    ray.init(ignore_reinit_error=True)
+    ray.init(address="local", num_cpus=4, num_gpus=0, object_store_memory=256 * 1024 * 1024, ignore_reinit_error=True)
     yield
     ray.shutdown()
 

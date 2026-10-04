@@ -34,6 +34,10 @@ def ray_setup():
     if ray.is_initialized():
         ray.shutdown()
     ray.init(
+        address="local",
+        num_cpus=4,
+        num_gpus=0,
+        object_store_memory=256 * 1024 * 1024,
         ignore_reinit_error=True,
         runtime_env={"env_vars": {"RAY_DEBUG": "1", "RAY_DEDUP_LOGS": "0"}},
         log_to_driver=True,
