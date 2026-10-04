@@ -733,7 +733,7 @@ class AsyncSimpleStorageManager(StorageManager):
             raise ValueError("Storage unit manifest contains duplicate storage unit IDs.")
 
         controller_path = Path(checkpoint_dir) / "controller_state.pkl"
-        expected_fields = [None] * len(su_ids)
+        expected_fields: Sequence[dict | None] = [None] * len(su_ids)
         if controller_path.exists():
             with open(controller_path, "rb") as f:
                 controller_state = pickle.load(f)
