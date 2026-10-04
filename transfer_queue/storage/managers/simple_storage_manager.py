@@ -15,6 +15,7 @@
 
 import asyncio
 import os
+import pickle
 import warnings
 from collections import defaultdict
 from collections.abc import Awaitable, Mapping, Sequence
@@ -86,6 +87,60 @@ async def _settle_storage_operations(operations: Sequence[Awaitable[Any]]) -> No
                     "Additional storage operation failure", exc_info=(type(result), result, result.__traceback__)
                 )
         raise first_error
+
+
+def _checkpoint_field_ownership(state: dict, num_units: int) -> list[dict]:
+    """Validate saved metadata and project field ownership onto modulo-selected shards."""
+    shards: list[dict] = [{} for _ in range(num_units)]
+    index_manager = state["index_manager"]
+    owners: set[int] = set()
+    for partition_id, partition in state["partitions"].items():
+        indexes = partition.global_indexes
+        allocated = indexes | partition.pre_allocated_global_indexes
+        if allocated != set(index_manager["partition_to_indexes"].get(partition_id, set())):
+            raise ValueError(f"Checkpoint index ownership mismatch: partition={partition_id!r}")
+        if indexes & partition.pre_allocated_global_indexes or owners & allocated:
+            raise ValueError(f"Checkpoint has overlapping index ownership: partition={partition_id!r}")
+        owners.update(allocated)
+        if any(index < 0 or index >= index_manager["global_index_counter"] for index in allocated):
+            raise ValueError(f"Checkpoint index outside allocation counter: partition={partition_id!r}")
+        reverse_keys = {index: key for key, index in partition.keys_mapping.items()}
+        if (
+            partition.revert_keys_mapping != reverse_keys
+            or len(reverse_keys) != len(partition.keys_mapping)
+            or not set(reverse_keys).issubset(indexes)
+        ):
+            raise ValueError(f"Checkpoint key/index ownership mismatch: partition={partition_id!r}")
+        if not set(partition.field_metadata).issubset(partition.field_name_mapping):
+            raise ValueError(f"Checkpoint field mapping mismatch: partition={partition_id!r}")
+        columns = list(partition.field_name_mapping.values())
+        if len(set(columns)) != len(columns):
+            raise ValueError(f"Checkpoint has duplicate field columns: partition={partition_id!r}")
+        for field_name, column in partition.field_name_mapping.items():
+            if column < 0 or column >= partition.production_status.shape[1]:
+                raise ValueError(
+                    f"Checkpoint field column out of range: partition={partition_id!r}, field={field_name!r}"
+                )
+            produced = set(torch.where(partition.production_status[:, column] == 1)[0].tolist())
+            field_meta = partition.field_metadata.get(field_name)
+            field_indexes = field_meta.global_indexes if field_meta is not None else set()
+            if not produced.issubset(field_indexes) or not field_indexes.issubset(indexes):
+                raise ValueError(
+                    f"Checkpoint field ownership mismatch: partition={partition_id!r}, field={field_name!r}"
+                )
+            for index in field_indexes:
+                shards[index % num_units].setdefault(field_name, {})[index] = (
+                    partition_id,
+                    partition.revert_keys_mapping.get(index),
+                    index in produced,
+                )
+    manager_owners = set().union(*index_manager["partition_to_indexes"].values())
+    if manager_owners != owners or not set(index_manager["allocated_indexes"]).issubset(owners):
+        raise ValueError("Checkpoint index manager contains unowned indexes.")
+    reusable = index_manager["reusable_indexes"]
+    if len(reusable) != len(set(reusable)) or set(reusable) & owners:
+        raise ValueError("Checkpoint index manager has conflicting reusable indexes.")
+    return shards
 
 
 class RoutingGroup(NamedTuple):
@@ -598,6 +653,7 @@ class AsyncSimpleStorageManager(StorageManager):
         self,
         path: str,
         target_storage_unit: str,
+        expected_fields: dict[str, dict[int, tuple[str, str | None, bool]]] | None,
         socket: zmq.Socket = None,
     ):
         try:
@@ -605,7 +661,7 @@ class AsyncSimpleStorageManager(StorageManager):
                 request_type=ZMQRequestType.LOAD_STORAGE_CHECKPOINT,  # type: ignore[arg-type]
                 sender_id=self.storage_manager_id,
                 receiver_id=target_storage_unit,
-                body={"path": path},
+                body={"path": path, "expected_fields": expected_fields},
             )
             await socket.send_multipart(request_msg.serialize(), copy=False)
             messages = await socket.recv_multipart(copy=False)
@@ -667,14 +723,26 @@ class AsyncSimpleStorageManager(StorageManager):
             )
 
         entries = sorted(su_info_list, key=lambda e: e["position"])
+        if [entry["position"] for entry in entries] != list(range(len(su_ids))):
+            raise ValueError("Storage unit manifest positions must cover each shard exactly once.")
+        if len({entry["storage_unit_id"] for entry in entries}) != len(su_ids):
+            raise ValueError("Storage unit manifest contains duplicate storage unit IDs.")
+
+        controller_path = Path(checkpoint_dir) / "controller_state.pkl"
+        expected_fields: Sequence[dict | None] = [None] * len(su_ids)
+        if controller_path.exists():
+            with open(controller_path, "rb") as f:
+                controller_state = pickle.load(f)
+            expected_fields = _checkpoint_field_ownership(controller_state, len(su_ids))
         tasks = [
             self._load_single_storage_unit(
                 str(su_dir / f"su_{entry['position']}_{entry['storage_unit_id']}.pkl"),
                 target_storage_unit=su_ids[entry["position"]],
+                expected_fields=expected_fields[entry["position"]],
             )
             for entry in entries
         ]
-        await asyncio.gather(*tasks)
+        await _settle_storage_operations(tasks)
 
         logger.info(f"[{self.storage_manager_id}]: restored {len(su_ids)} storage units from {su_dir}")
 
