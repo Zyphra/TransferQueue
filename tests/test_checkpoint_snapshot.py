@@ -78,8 +78,11 @@ def test_controller_frontier_keeps_recycled_indexes_at_the_saved_cut(tmp_path, m
     original_dump = pickle.dump
 
     def append_after_cut(state, stream, **kwargs):
-        manager.allocate_indexes("after-cut", 1)
-        sampler["cursor"][0] = 99
+        # Tensor serialization can call pickle.dump again.
+        # Mutate the live state only once for this cut.
+        if "after-cut" not in manager.partition_to_indexes:
+            manager.allocate_indexes("after-cut", 1)
+            sampler["cursor"][0] = 99
         return original_dump(state, stream, **kwargs)
 
     monkeypatch.setattr(pickle, "dump", append_after_cut)
