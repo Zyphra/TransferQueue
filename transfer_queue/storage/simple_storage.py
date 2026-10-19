@@ -52,6 +52,63 @@ TQ_STORAGE_POLLER_TIMEOUT = int(os.environ.get("TQ_STORAGE_POLLER_TIMEOUT", 5)) 
 TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
 
 
+class _CheckpointPickler(pickle.Pickler):
+    """Narrow owned route payloads on disk while ordinary readers restore int16."""
+
+    def __init__(self, stream, state):
+        super().__init__(stream, protocol=pickle.HIGHEST_PROTOCOL)
+        self.routes = {id(value) for value in state["field_data"].get("routed_experts", {}).values()}
+        if not self.routes:
+            return
+        pending, seen, owners = [state], set(), {}
+        while pending:
+            value = pending.pop()
+            if id(value) in seen:
+                continue
+            seen.add(id(value))
+            if type(value) is torch.Tensor:
+                if value.device.type != "cpu" or value.layout != torch.strided or value.is_nested:
+                    self.routes.clear()
+                    break
+                storage = value.untyped_storage()
+                identity = (storage.data_ptr(), storage.nbytes())
+                owners.setdefault(identity, set()).add(id(value))
+            elif type(value) is dict:
+                pending.extend(value.keys())
+                pending.extend(value.values())
+            elif type(value) in (list, tuple, set, frozenset):
+                pending.extend(value)
+            elif type(value) not in (str, bytes, bytearray, int, float, bool, type(None)):
+                # Opaque objects and NumPy views can conceal shared tensor storage.
+                self.routes.clear()
+                break
+        for aliases in owners.values():
+            if len(aliases) > 1:
+                self.routes.difference_update(aliases)
+
+    def reducer_override(self, value):
+        if id(value) not in self.routes:
+            return NotImplemented
+        if (
+            type(value) is not torch.Tensor
+            or value.dtype != torch.int16
+            or not value.is_contiguous()
+            or value._base is not None
+            or value.storage_offset() != 0
+            or value.untyped_storage().nbytes() != value.numel() * value.element_size()
+            or value.is_neg()
+            or value.__dict__
+            or any(name is not None for name in value.names)
+        ):
+            return NotImplemented
+        array = value.numpy()
+        if array.size and (array.min() < 0 or array.max() > 255):
+            return NotImplemented
+        # This existing Torch reducer casts back to the original dtype on load,
+        # including in readers that predate checkpoint packing.
+        return torch._utils._rebuild_device_tensor_from_numpy, (array.astype(np.uint8), torch.int16, "cpu", False)
+
+
 class StorageUnitData:
     """Storage unit for managing 2D data structure (samples × fields).
 
@@ -660,7 +717,7 @@ class SimpleStorageUnit:
 
             def write():
                 with open(path, "wb") as f:
-                    pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    _CheckpointPickler(f, state).dump(state)
                     f.flush()
                     os.fsync(f.fileno())
 
