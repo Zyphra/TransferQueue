@@ -150,6 +150,8 @@ def _install_unit_control(tq, key, value, tmp_path, *, capture=False, prepare_fa
         def dump(state, stream, *args, **kwargs):
             if threading.current_thread().name == "StorageCheckpointWriter":
                 wait("write")
+                if write_fail == "programming":
+                    raise TypeError("injected invalid checkpoint payload")
                 if write_fail:
                     raise OSError("injected storage write failure")
             return original_dump(state, stream, *args, **kwargs)
@@ -174,13 +176,16 @@ def _install_unit_control(tq, key, value, tmp_path, *, capture=False, prepare_fa
 def _unit_status(tq, checkpoint, unit):
     position, identity = unit
     manager = tq.get_client().storage_manager
-    return tq.get_client()._run_coroutine(
+    result = tq.get_client()._run_coroutine(
         manager._save_single_storage_unit(
             str(checkpoint / "simple_storage" / f"su_{position}_{identity}.pkl"),
             target_storage_unit=identity,
             phase="status",
         )
-    )["done"]
+    )
+    if result.get("failure") is not None:
+        raise RuntimeError(result["failure"]["message"])
+    return result["done"]
 
 
 def _wait_unit(tq, checkpoint, unit, *, failed=False):
@@ -319,3 +324,110 @@ def test_two_unit_mixed_budget_fallback_waits_for_detached_writer(two_units, tmp
     tq.load_checkpoint(path)
     for index, value in enumerate(values):
         assert torch.equal(tq.kv_batch_get(keys=[f"row{index}"], partition_id="two-su")["tokens"][0], value)
+
+
+@pytest.mark.parametrize("timed_out", [False, True], ids=["write-error", "deadline-late-success"])
+def test_failed_future_retirement_waits_for_every_unit(two_units, tmp_path, timed_out):
+    import hashlib
+    import shutil
+    import time
+
+    tq = two_units
+    values = [torch.arange(12), torch.arange(17) + 100]
+    for index, value in enumerate(values):
+        tq.kv_put(key=f"row{index}", partition_id="two-su", fields={"tokens": value})
+    prior = tmp_path / "prior"
+    tq.save_checkpoint(prior)
+    original = {
+        str(p.relative_to(prior)): hashlib.sha256(p.read_bytes()).hexdigest() for p in prior.rglob("*") if p.is_file()
+    }
+    gates = [tmp_path / "unit0", tmp_path / "unit1"]
+    units = [
+        _install_unit_control(tq, f"row{i}", value, gates[i], write_fail=i == 0 and not timed_out)
+        for i, value in enumerate(values)
+    ]
+    assert {unit[0] for unit in units} == {0, 1}
+    path = tmp_path / "failed"
+    staging = tmp_path / "failed.tmp"
+    future = tq.save_checkpoint(
+        path, async_storage=True, max_snapshot_bytes=1024 * 1024, timeout_s=0.2 if timed_out else 10
+    )
+    try:
+        for gate in gates:
+            _wait_file(gate / "write-entered")
+        if not timed_out:
+            (gates[0] / "write-release").touch()
+        with pytest.raises(tq.CheckpointStorageError) as first:
+            future.result(timeout=5)
+        assert first.value.timed_out is timed_out
+        if not timed_out:
+            assert first.value.failures[0]["type"] == "OSError"
+            assert "injected storage write failure" in first.value.failures[0]["message"]
+        assert tq.checkpoint_status(path, future) == {"settled": False}
+        with pytest.raises(RuntimeError, match="unsettled"):
+            tq.retire_checkpoint(path, future)
+        with pytest.raises(tq.CheckpointStorageError) as repeated:
+            tq.save_checkpoint(tmp_path / "forbidden", async_storage=True, max_snapshot_bytes=1024 * 1024)
+        assert repeated.value is first.value
+        assert staging.exists() and not path.exists()
+        assert not (staging / "simple_storage" / "storage_unit_info.json").exists()
+    finally:
+        for gate in gates:
+            (gate / "write-release").touch()
+        deadline = time.monotonic() + 10
+        while not tq.checkpoint_status(path, future)["settled"]:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+    assert not path.exists(), "a late successful writer cannot revive the failed Future's publication"
+    assert original == {
+        str(p.relative_to(prior)): hashlib.sha256(p.read_bytes()).hexdigest() for p in prior.rglob("*") if p.is_file()
+    }
+    with pytest.raises(ValueError, match="owned pending"):
+        tq.retire_checkpoint(tmp_path / "different", future)
+    shutil.rmtree(staging)
+    tq.retire_checkpoint(path, future)
+    assert not staging.exists(), "status/retirement must not recreate staging"
+    tq.save_checkpoint(tmp_path / "later")
+    tq.load_checkpoint(tmp_path / "later")
+    assert torch.equal(tq.kv_batch_get(keys=["row1"], partition_id="two-su")["tokens"][0], values[1])
+
+
+def test_mixed_writer_corruption_is_not_retirable_io(two_units, tmp_path):
+    import time
+
+    tq = two_units
+    values = [torch.arange(12), torch.arange(17)]
+    for index, value in enumerate(values):
+        tq.kv_put(key=f"row{index}", partition_id="two-su", fields={"tokens": value})
+    gates = [tmp_path / "unit0", tmp_path / "unit1"]
+    units = [
+        _install_unit_control(tq, f"row{i}", value, gates[i], write_fail=True if i == 0 else "programming")
+        for i, value in enumerate(values)
+    ]
+    assert {unit[0] for unit in units} == {0, 1}
+    path = tmp_path / "mixed"
+    future = tq.save_checkpoint(path, async_storage=True, max_snapshot_bytes=1024 * 1024)
+    try:
+        for gate in gates:
+            _wait_file(gate / "write-entered")
+        (gates[0] / "write-release").touch()
+        with pytest.raises(tq.CheckpointStorageError):
+            future.result(timeout=5)
+        assert not tq.checkpoint_status(path, future)["settled"]
+    finally:
+        for gate in gates:
+            (gate / "write-release").touch()
+        deadline = time.monotonic() + 10
+        while True:
+            status = tq.get_client().save_storage_checkpoint(
+                str(tmp_path / "mixed.tmp"), phase="status", publish_manifest=False
+            )
+            if status["done"]:
+                break
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+    assert {error["type"] for error in status["failures"]} == {"OSError", "TypeError"}
+    with pytest.raises(RuntimeError, match="Non-storage"):
+        tq.retire_checkpoint(path, future)
+    assert not path.exists()
+    assert (tmp_path / "mixed.tmp").exists()

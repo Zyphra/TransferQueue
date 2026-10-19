@@ -18,12 +18,14 @@ import os
 from .client import TransferQueueClient
 from .dataloader import StreamingDataLoader, StreamingDataset
 from .interface import (
+    CheckpointStorageError,
     async_kv_batch_get,
     async_kv_batch_get_by_meta,
     async_kv_batch_put,
     async_kv_clear,
     async_kv_list,
     async_kv_put,
+    checkpoint_status,
     close,
     get_client,
     get_metrics_endpoint,
@@ -35,6 +37,7 @@ from .interface import (
     kv_list,
     kv_put,
     load_checkpoint,
+    retire_checkpoint,
     save_checkpoint,
 )
 from .metadata import BatchMeta, KVBatchMeta
@@ -66,6 +69,9 @@ __all__ = (
     ]
     + [
         # Checkpoint Interface
+        "CheckpointStorageError",
+        "checkpoint_status",
+        "retire_checkpoint",
         "save_checkpoint",
         "load_checkpoint",
     ]

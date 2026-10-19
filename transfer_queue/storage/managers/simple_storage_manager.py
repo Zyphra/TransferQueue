@@ -682,7 +682,7 @@ class AsyncSimpleStorageManager(StorageManager):
             ) from e
 
     async def save_checkpoint(
-        self, checkpoint_dir: str, *, phase="save", indexes=None, max_snapshot_bytes=0
+        self, checkpoint_dir: str, *, phase="save", indexes=None, max_snapshot_bytes=0, publish_manifest=True
     ) -> dict | None:
         """Dump all storage units to the storage_units/ subdirectory of checkpoint_dir.
 
@@ -692,7 +692,8 @@ class AsyncSimpleStorageManager(StorageManager):
         import json
 
         su_dir = Path(checkpoint_dir) / _SU_SUBDIR
-        su_dir.mkdir(parents=True, exist_ok=True)
+        if phase != "status":
+            su_dir.mkdir(parents=True, exist_ok=True)
 
         su_ids = list(self.storage_unit_infos.keys())
         paths = [str(su_dir / f"su_{pos}_{su_id}.pkl") for pos, su_id in enumerate(su_ids)]
@@ -709,15 +710,32 @@ class AsyncSimpleStorageManager(StorageManager):
             )
             for su_id, path in zip(su_ids, paths, strict=False)
         ]
-        results = await asyncio.gather(*tasks)
+        # Observe every response before reporting settlement; a sibling may
+        # still own a writer when another storage unit reports failure.
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
         if phase == "prepare":
             return {
                 "prepared": all(item["prepared"] for item in results),
                 "retained_bytes": sum(item.get("retained_bytes") or 0 for item in results),
             }
-        if phase == "status" and not all(item["done"] for item in results):
-            return {"done": False}
+        status = (
+            {
+                "done": all(item["done"] for item in results),
+                "failures": [
+                    {"storage_unit_id": su_id, **item["failure"]}
+                    for su_id, item in zip(su_ids, results, strict=True)
+                    if item.get("failure") is not None
+                ],
+            }
+            if phase in ("status", "save")
+            else None
+        )
+        if status is not None and (not status["done"] or status["failures"] or not publish_manifest):
+            return status
 
         su_info_list = [{"position": pos, "storage_unit_id": su_id} for pos, su_id in enumerate(su_ids)]
         with open(su_dir / _SU_INFO_FILE, "w") as f:
@@ -726,7 +744,7 @@ class AsyncSimpleStorageManager(StorageManager):
             os.fsync(f.fileno())
 
         logger.info(f"[{self.storage_manager_id}]: saved {len(su_ids)} storage units to {su_dir}")
-        return {"done": True} if phase == "status" else None
+        return status if phase == "status" else None
 
     async def load_checkpoint(self, checkpoint_dir: str) -> None:
         """Restore all storage units from the storage_units/ subdirectory of checkpoint_dir."""
