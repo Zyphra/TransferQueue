@@ -351,6 +351,14 @@ Please kindly cite our paper if you find this repo is useful:
 
 ### Bounded asynchronous checkpoint storage
 
+SimpleStorage checkpoint writers store owned, contiguous CPU `routed_experts`
+int16 tensors as uint8 when every value is in 0..255. Ordinary pickle/Torch
+readers reconstruct the original int16 dtype, shape and values, including older
+readers; existing checkpoints remain readable. Live storage and snapshot byte
+accounting stay unchanged. Views, shared backing, out-of-range values and
+uncertain ownership use ordinary serialization. Packing adds a range scan and
+a temporary uint8 copy in the writer; it is not a bound on process RSS.
+
 For detached SimpleStorage saves, committed `metadata.json` includes an optional
 `storage_checkpoint` receipt: aggregate async/fallback mode and the existing
 per-unit ID, IP, preparation flag, accounted retained bytes (or `null` when
