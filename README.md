@@ -346,3 +346,18 @@ Please kindly cite our paper if you find this repo is useful:
   year={2025}
 }
 ```
+
+### Bounded asynchronous checkpoint storage
+
+`save_checkpoint(..., async_storage=True, max_snapshot_bytes=...)` keeps the
+controller and sampler cut synchronous, captures replace-only SimpleStorage
+payload references, then returns a future for durable storage and publication.
+Quiesce existing ready-row mutations through capture; fresh append-only producers
+may continue. Join the future before publishing an enclosing checkpoint or
+closing TransferQueue. Only one save may be pending. Unaccountable payloads or a
+per-unit retention estimate above the divided byte budget use synchronous writes.
+This budget bounds accounted retained stores and map estimates, not process RSS
+or serialization scratch space. Other backends and the default API stay
+synchronous. Writer failure leaves staging uncommitted and prevents another save
+in that client process; allocation teardown owns an uninterruptible filesystem
+thread. Checkpoints require a shared filesystem for multiple nodes.

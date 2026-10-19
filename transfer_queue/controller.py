@@ -2160,11 +2160,13 @@ class TransferQueueController:
         )
 
     def _handle_save_controller_checkpoint_request(self, request_msg: ZMQMessage) -> ZMQMessage:
-        self.save_checkpoint(request_msg.body["path"])
+        frontier = self.save_checkpoint(
+            request_msg.body["path"], return_frontier=request_msg.body.get("frontier", False)
+        )
         return self._make_response(
             request_msg,
             ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT_RESPONSE,
-            {"success": True},
+            {"success": True, **({"indexes": frontier} if frontier is not None else {})},
         )
 
     def _handle_load_controller_checkpoint_request(self, request_msg: ZMQMessage) -> ZMQMessage:
@@ -2187,7 +2189,7 @@ class TransferQueueController:
         """Retrieve the global config of TransferQueue."""
         return self.tq_config
 
-    def save_checkpoint(self, path: str) -> None:
+    def save_checkpoint(self, path: str, *, return_frontier: bool = False) -> list[int] | None:
         """Serialize controller state directly to a file.
 
         Writes in-process to avoid transmitting the payload back over the
@@ -2209,11 +2211,15 @@ class TransferQueueController:
                     "global_index_counter": self.index_manager.global_index_counter,
                     "allocated_indexes": set(self.index_manager.allocated_indexes),
                 },
-                "sampler": self.sampler.save_checkpoint(),
+                "sampler": copy.deepcopy(self.sampler.save_checkpoint()),
             }
             with open(path, "wb") as f:
                 pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+                f.flush()
+                os.fsync(f.fileno())
             logger.info(f"[{self.controller_id}]: dumped to {path}")
+            if return_frontier:
+                return sorted(state["index_manager"]["allocated_indexes"])
         except Exception as e:
             raise RuntimeError(f"[{self.controller_id}]: save checkpoint failed: {e}") from e
 

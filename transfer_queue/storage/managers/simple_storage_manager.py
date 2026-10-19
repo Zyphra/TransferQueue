@@ -542,13 +542,14 @@ class AsyncSimpleStorageManager(StorageManager):
         path: str,
         target_storage_unit: str,
         socket: zmq.Socket = None,
+        **snapshot,
     ):
         try:
             request_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.SAVE_STORAGE_CHECKPOINT,  # type: ignore[arg-type]
                 sender_id=self.storage_manager_id,
                 receiver_id=target_storage_unit,
-                body={"path": path},
+                body={"path": path, **snapshot},
             )
             await socket.send_multipart(request_msg.serialize(), copy=False)
             messages = await socket.recv_multipart(copy=False)
@@ -561,6 +562,7 @@ class AsyncSimpleStorageManager(StorageManager):
                     f"Storage unit {target_storage_unit} failed to save checkpoint to {path}: "
                     f"{response_msg.body.get('message', 'unknown error')}"
                 )
+            return response_msg.body
         except Exception as e:
             raise RuntimeError(
                 f"[{self.storage_manager_id}]: Error dumping storage unit {target_storage_unit}: {str(e)}"
@@ -596,7 +598,9 @@ class AsyncSimpleStorageManager(StorageManager):
                 f"[{self.storage_manager_id}]: Error restoring for storage unit {target_storage_unit}: {str(e)}"
             ) from e
 
-    async def save_checkpoint(self, checkpoint_dir: str) -> None:
+    async def save_checkpoint(
+        self, checkpoint_dir: str, *, phase="save", indexes=None, max_snapshot_bytes=0
+    ) -> dict | None:
         """Dump all storage units to the storage_units/ subdirectory of checkpoint_dir.
 
         Writes a storage_units/su_info.json manifest for load_checkpoint to use.
@@ -610,16 +614,36 @@ class AsyncSimpleStorageManager(StorageManager):
         su_ids = list(self.storage_unit_infos.keys())
         paths = [str(su_dir / f"su_{pos}_{su_id}.pkl") for pos, su_id in enumerate(su_ids)]
         tasks = [
-            self._save_single_storage_unit(path, target_storage_unit=su_id)
+            self._save_single_storage_unit(
+                path,
+                target_storage_unit=su_id,
+                phase=phase,
+                **(
+                    {"indexes": indexes, "max_snapshot_bytes": max_snapshot_bytes // max(1, len(su_ids))}
+                    if phase == "prepare"
+                    else {}
+                ),
+            )
             for su_id, path in zip(su_ids, paths, strict=False)
         ]
-        await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks)
+
+        if phase == "prepare":
+            return {
+                "prepared": all(item["prepared"] for item in results),
+                "retained_bytes": sum(item.get("retained_bytes") or 0 for item in results),
+            }
+        if phase == "status" and not all(item["done"] for item in results):
+            return {"done": False}
 
         su_info_list = [{"position": pos, "storage_unit_id": su_id} for pos, su_id in enumerate(su_ids)]
         with open(su_dir / _SU_INFO_FILE, "w") as f:
             json.dump(su_info_list, f)
+            f.flush()
+            os.fsync(f.fileno())
 
         logger.info(f"[{self.storage_manager_id}]: saved {len(su_ids)} storage units to {su_dir}")
+        return {"done": True} if phase == "status" else None
 
     async def load_checkpoint(self, checkpoint_dir: str) -> None:
         """Restore all storage units from the storage_units/ subdirectory of checkpoint_dir."""

@@ -13,13 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import json
+import math
 import os
 import shutil
 import subprocess
 import time
+from concurrent.futures import Future
 from importlib import resources
 from pathlib import Path
+from threading import Lock, Thread
 from typing import Any, Callable
 
 import ray
@@ -233,6 +237,10 @@ def close():
     global _TQ_CLIENT
     global _TQ_STORAGE
     global _TQ_CONTROLLER
+    global _PENDING_CHECKPOINT
+    if _PENDING_CHECKPOINT is not None and not _PENDING_CHECKPOINT.done():
+        raise RuntimeError("join the pending checkpoint Future before closing TransferQueue")
+    _PENDING_CHECKPOINT = None
 
     try:
         if _TQ_STORAGE:
@@ -971,6 +979,35 @@ def get_client():
 
 _METADATA_FILE = "metadata.json"
 _CONTROLLER_FILE = "controller_state.pkl"
+_CHECKPOINT_LOCK = Lock()
+_PENDING_CHECKPOINT: Future | None = None
+
+
+def _commit_checkpoint(tmp_dir: Path, checkpoint_dir: Path, old_dir: Path, metadata: dict) -> None:
+    """Publish only after payload files and their directory entries are durable."""
+    with open(tmp_dir / _METADATA_FILE, "w") as stream:
+        json.dump(metadata, stream, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+    for directory in [*sorted((p for p in tmp_dir.rglob("*") if p.is_dir()), reverse=True), tmp_dir]:
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    if checkpoint_dir.exists():
+        if old_dir.exists():
+            shutil.rmtree(old_dir)
+        checkpoint_dir.rename(old_dir)
+    tmp_dir.rename(checkpoint_dir)
+    descriptor = os.open(checkpoint_dir.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    if old_dir.exists():
+        shutil.rmtree(old_dir)
+    logger.info(f"Checkpoint saved to {checkpoint_dir}")
 
 
 def save_checkpoint(
@@ -978,88 +1015,113 @@ def save_checkpoint(
     *,
     include_storage: bool = True,
     metadata: dict[str, Any] | None = None,
-) -> None:
-    """Save a full checkpoint of the TransferQueue system state.
+    async_storage: bool = False,
+    max_snapshot_bytes: int = 0,
+    timeout_s: float = 900.0,
+) -> Future | None:
+    """Save controller and payload state on a shared filesystem.
 
-    .. note::
-        **Multi-node limitation**: checkpoint_dir must reside on a shared network
-        filesystem (e.g. NFS, GPFS, Lustre) accessible from all nodes.
-        Single-node deployments have no such requirement.
-
-    Args:
-        checkpoint_dir: Directory to save the checkpoint (created if not exists).
-        include_storage: Whether to save storage backend state. Set to False to
-                         save controller metadata only (e.g. for KV backends where
-                         data persists externally and does not need to be re-saved).
-                         For SimpleStorage (in-memory), this flag is ignored and
-                         storage is always saved — skipping it would cause data loss
-                         on restart.
-        metadata: User-defined key-value pairs written into metadata.json.
-                  Example: {"time_stamp": 1234567.891234, "step": 10}
-
-    Raises:
-        RuntimeError: TransferQueue is not initialized.
-        OSError: Failed to write checkpoint files.
+    By default this blocks until publication. With ``async_storage=True``,
+    SimpleStorage captures detached field maps before returning a Future. The
+    caller must join that Future before publishing its enclosing checkpoint.
+    Existing-row mutations must be quiesced through capture; fresh append-only
+    producers may continue. Controller state, including sampler state, stays at
+    the synchronous capture frontier. Unknown payload ownership or a retention
+    estimate above ``max_snapshot_bytes`` falls back to a synchronous write.
+    The positive byte budget covers retained payload stores and map estimates,
+    not a process RSS limit or pickle's transient memory. Only one save can be
+    pending; a failed save prevents another save in the same client process.
+    Other storage backends retain their synchronous behavior. ``include_storage``
+    can disable external-backend dumps; in-memory SimpleStorage always saves its
+    payloads. ``metadata`` is copied into the existing metadata.json user section.
     """
+    global _PENDING_CHECKPOINT
     if _TQ_CONTROLLER is None:
         raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")
+    if async_storage:
+        if type(max_snapshot_bytes) is not int or max_snapshot_bytes <= 0:
+            raise ValueError("max_snapshot_bytes must be a positive integer for async storage")
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("timeout_s must be positive and finite")
 
-    checkpoint_dir = Path(checkpoint_dir)
-    tmp_dir = checkpoint_dir.parent / f"{checkpoint_dir.name}.tmp"
-    old_dir = checkpoint_dir.parent / f"{checkpoint_dir.name}.old"
-
-    if tmp_dir.exists():
-        shutil.rmtree(tmp_dir)
-    tmp_dir.mkdir(parents=True)
-
-    try:
+    with _CHECKPOINT_LOCK:
+        if _PENDING_CHECKPOINT is not None:
+            _PENDING_CHECKPOINT.result(timeout=timeout_s)
         client = _maybe_create_tq_client()
-
-        controller_path = tmp_dir / _CONTROLLER_FILE
-        client.save_controller_checkpoint(str(controller_path))
-        logger.info("Controller state saved.")
-
+        detached = async_storage and isinstance(client.storage_manager, AsyncSimpleStorageManager)
         if not include_storage and isinstance(client.storage_manager, AsyncSimpleStorageManager):
-            logger.warning(
-                "include_storage=False has no effect for SimpleStorage: "
-                "in-memory data would be lost on restart. Forcing include_storage=True."
-            )
+            logger.warning("SimpleStorage is in-memory; forcing include_storage=True.")
             include_storage = True
-
-        if include_storage:
-            try:
-                client.save_storage_checkpoint(str(tmp_dir))
-            except NotImplementedError:
-                logger.warning("Storage backend does not support checkpoint; storage data will not be saved.")
-                include_storage = False
-
-        meta_content = {
-            "storage_saved": include_storage,
-            "user_metadata": metadata or {},
-        }
-        with open(tmp_dir / _METADATA_FILE, "w") as f:
-            json.dump(meta_content, f, indent=2)
-
-        # Atomic replacement: move old aside, move new in place, delete old
-        if checkpoint_dir.exists():
-            if old_dir.exists():
-                shutil.rmtree(old_dir)
-            checkpoint_dir.rename(old_dir)
-
-        tmp_dir.rename(checkpoint_dir)
-
-        if old_dir.exists():
-            shutil.rmtree(old_dir)
-
-        logger.info(f"Checkpoint saved to {checkpoint_dir}")
-
-    except Exception:
+        checkpoint_dir = Path(checkpoint_dir)
+        tmp_dir = checkpoint_dir.parent / f"{checkpoint_dir.name}.tmp"
+        old_dir = checkpoint_dir.parent / f"{checkpoint_dir.name}.old"
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir)
-        if old_dir.exists() and not checkpoint_dir.exists():
-            # Restore old checkpoint if new one failed
-            old_dir.rename(checkpoint_dir)
-        raise
+        tmp_dir.mkdir(parents=True)
+        writers_started = False
+        try:
+            controller_path = str(tmp_dir / _CONTROLLER_FILE)
+            if detached:
+                frontier = client.save_controller_checkpoint(controller_path, frontier=True)
+            else:
+                client.save_controller_checkpoint(controller_path)
+            prepared = None
+            if include_storage:
+                try:
+                    if detached:
+                        # A failed fanout may already have started a subset of writers.
+                        writers_started = True
+                        prepared = client.save_storage_checkpoint(
+                            str(tmp_dir),
+                            phase="prepare",
+                            indexes=frontier["indexes"],
+                            max_snapshot_bytes=max_snapshot_bytes,
+                        )
+                    else:
+                        client.save_storage_checkpoint(str(tmp_dir))
+                except NotImplementedError:
+                    logger.warning("Storage backend does not support checkpoint; storage will not be saved.")
+                    include_storage = False
+            meta_content = {"storage_saved": include_storage, "user_metadata": copy.deepcopy(metadata or {})}
+
+            def finish():
+                if detached:
+                    deadline = time.monotonic() + timeout_s
+                    while not client.save_storage_checkpoint(str(tmp_dir), phase="status")["done"]:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("TransferQueue storage checkpoint write timed out")
+                        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+                _commit_checkpoint(tmp_dir, checkpoint_dir, old_dir, meta_content)
+
+            if prepared is not None and prepared["prepared"]:
+                future = Future()
+                future.set_running_or_notify_cancel()
+                _PENDING_CHECKPOINT = future
+
+                def complete():
+                    try:
+                        finish()
+                    except BaseException as error:
+                        future.set_exception(error)
+                    else:
+                        future.set_result(None)
+
+                Thread(target=complete, name="TransferQueueCheckpoint", daemon=True).start()
+                return future
+            finish()
+            return None
+        except BaseException as error:
+            if writers_started:
+                # A filesystem thread cannot be cancelled safely. Keep staging and
+                # reject a second save rather than deleting files still being written.
+                failed = Future()
+                failed.set_exception(error)
+                _PENDING_CHECKPOINT = failed
+            elif tmp_dir.exists():
+                shutil.rmtree(tmp_dir)
+            if old_dir.exists() and not checkpoint_dir.exists():
+                old_dir.rename(checkpoint_dir)
+            raise
 
 
 def load_checkpoint(
@@ -1081,6 +1143,9 @@ def load_checkpoint(
     """
     if _TQ_CONTROLLER is None:
         raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")
+
+    if _PENDING_CHECKPOINT is not None:
+        _PENDING_CHECKPOINT.result(timeout=0)
 
     checkpoint_dir = Path(checkpoint_dir)
     old_dir = checkpoint_dir.parent / f"{checkpoint_dir.name}.old"

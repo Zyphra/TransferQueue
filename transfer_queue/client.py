@@ -1090,7 +1090,9 @@ class AsyncTransferQueueClient:
         self,
         path: str,
         socket: zmq.asyncio.Socket | None = None,
-    ) -> None:
+        *,
+        frontier: bool = False,
+    ) -> dict | None:
         """Asynchronously save controller state to a file via ZMQ RPC.
 
         Sends a SAVE_CONTROLLER_CHECKPOINT request to the controller and waits
@@ -1106,12 +1108,13 @@ class AsyncTransferQueueClient:
             RuntimeError: If the RPC fails or an unexpected response is received.
         """
         try:
-            await self._request_controller(
+            response = await self._request_controller(
                 socket=socket,
                 request_type=ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT,
                 response_type=ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT_RESPONSE,
-                body={"path": path},
+                body={"path": path, "frontier": frontier},
             )
+            return response.body if frontier else None
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in save_controller_checkpoint: {str(e)}") from e
 
@@ -1146,7 +1149,7 @@ class AsyncTransferQueueClient:
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in load_controller_checkpoint: {str(e)}") from e
 
-    async def async_save_storage_checkpoint(self, checkpoint_dir: str) -> None:
+    async def async_save_storage_checkpoint(self, checkpoint_dir: str, **snapshot) -> dict | None:
         """Asynchronously save storage state to a directory via StorageManager.
 
         Delegates to the underlying StorageManager, which fans out save requests
@@ -1165,7 +1168,7 @@ class AsyncTransferQueueClient:
                 f"[{self.client_id}]: Storage manager not initialized. "
                 "Call initialize_storage_manager() before checkpoint operations."
             )
-        await self.storage_manager.save_checkpoint(checkpoint_dir)
+        return await self.storage_manager.save_checkpoint(checkpoint_dir, **snapshot)
 
     async def async_load_storage_checkpoint(self, checkpoint_dir: str) -> None:
         """Asynchronously restore storage state from a directory via StorageManager.
@@ -1705,7 +1708,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         return self._kv_list(partition_id=partition_id)
 
     # ==================== Checkpoint API ====================
-    def save_controller_checkpoint(self, path: str) -> None:
+    def save_controller_checkpoint(self, path: str, *, frontier: bool = False) -> dict | None:
         """Synchronously save controller state to a file via ZMQ RPC.
 
         Args:
@@ -1714,7 +1717,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         Raises:
             RuntimeError: If the RPC fails or an unexpected response is received.
         """
-        return self._save_controller_checkpoint(path)
+        return self._save_controller_checkpoint(path, frontier=frontier)
 
     def load_controller_checkpoint(self, path: str) -> None:
         """Synchronously restore controller state from a file via ZMQ RPC.
@@ -1728,7 +1731,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """
         return self._load_controller_checkpoint(path)
 
-    def save_storage_checkpoint(self, checkpoint_dir: str) -> None:
+    def save_storage_checkpoint(self, checkpoint_dir: str, **snapshot) -> dict | None:
         """Synchronously save storage state to a directory via StorageManager.
 
         Args:
@@ -1738,7 +1741,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
             RuntimeError: If the storage manager is not initialized.
             NotImplementedError: If the storage backend does not support checkpoint.
         """
-        return self._save_storage_checkpoint(checkpoint_dir)
+        return self._save_storage_checkpoint(checkpoint_dir, **snapshot)
 
     def load_storage_checkpoint(self, checkpoint_dir: str) -> None:
         """Synchronously restore storage state from a directory via StorageManager.
