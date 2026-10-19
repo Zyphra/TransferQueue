@@ -1152,6 +1152,18 @@ def save_checkpoint(
                     logger.warning("Storage backend does not support checkpoint; storage will not be saved.")
                     include_storage = False
             meta_content = {"storage_saved": include_storage, "user_metadata": copy.deepcopy(metadata or {})}
+            if prepared is not None:
+                # Keep only the bounded primitive receipt, not arbitrary replies.
+                # Failure here must not hide any checkpoint I/O failure below.
+                try:
+                    receipt = {
+                        "mode": "async" if prepared["prepared"] else "synchronous_fallback",
+                        "max_snapshot_bytes": max_snapshot_bytes,
+                        "storage_units": prepared["storage_units"],
+                    }
+                    meta_content["storage_checkpoint"] = json.loads(json.dumps(receipt, allow_nan=False))
+                except Exception:
+                    pass
 
             def finish():
                 if detached:

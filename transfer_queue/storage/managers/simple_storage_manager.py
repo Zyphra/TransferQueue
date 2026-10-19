@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import ipaddress
 import os
 import pickle
 import warnings
@@ -718,10 +719,37 @@ class AsyncSimpleStorageManager(StorageManager):
                 raise result
 
         if phase == "prepare":
-            return {
+            prepared = {
                 "prepared": all(item["prepared"] for item in results),
                 "retained_bytes": sum(item.get("retained_bytes") or 0 for item in results),
             }
+            # Diagnostics never decide capture, settlement, or publication.
+            try:
+                if len(su_ids) > 256 or type(max_snapshot_bytes) is not int or not 0 <= max_snapshot_bytes < 2**63:
+                    raise ValueError("checkpoint receipt exceeds the storage-unit limit")
+                units = []
+                for su_id, item in zip(su_ids, results, strict=True):
+                    size = item.get("retained_bytes")
+                    if (
+                        type(su_id) is not str
+                        or not 0 < len(su_id) <= 128
+                        or type(item["prepared"]) is not bool
+                        or (size is not None and (type(size) is not int or not 0 <= size < 2**63))
+                    ):
+                        raise ValueError("invalid checkpoint receipt primitives")
+                    units.append(
+                        {
+                            "storage_unit_id": su_id,
+                            "ip": str(ipaddress.ip_address(self.storage_unit_infos[su_id].ip)),
+                            "prepared": item["prepared"],
+                            "retained_bytes": size,
+                            "max_snapshot_bytes": max_snapshot_bytes // max(1, len(su_ids)),
+                        }
+                    )
+                prepared["storage_units"] = units
+            except Exception:
+                pass
+            return prepared
         status = (
             {
                 "done": all(item["done"] for item in results),
