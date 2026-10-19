@@ -84,7 +84,7 @@ def test_unsupported_or_shared_backing_uses_normal_pickle(kind):
         route = base.float()
     state = state_for(route, **other)
     payload = packed(state)
-    assert b"_rebuild_device_tensor_from_numpy" not in payload
+    assert (b"_rebuild_device_tensor_from_numpy" in payload) == (kind in ("view", "full_view"))
     restored = pickle.loads(payload)["field_data"]
     assert torch.equal(restored["routed_experts"][0], route)
     if kind in ("alias", "nested_alias"):
@@ -99,8 +99,29 @@ def test_unsupported_or_shared_backing_uses_normal_pickle(kind):
 
 def test_same_tensor_object_keeps_identity_across_fields():
     route = torch.arange(16, dtype=torch.int16)
-    restored = pickle.loads(packed(state_for(route, duplicate=route)))["field_data"]
+    state = state_for(route, duplicate=route)
+    restored = pickle.loads(packed(state))["field_data"]
+    ordinary = pickle.loads(pickle.dumps(state))["field_data"]
     assert restored["routed_experts"][0] is restored["duplicate"][0]
+    restored["duplicate"][0][0] = ordinary["duplicate"][0][0] = 42
+    assert torch.equal(restored["routed_experts"][0], ordinary["routed_experts"][0])
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_shared_route_spans_preserve_ordinary_alias_behavior(overlap):
+    backing = torch.arange(32, dtype=torch.int16)
+    rows = {0: backing[:16], 1: backing[8:24] if overlap else backing[16:]}
+    state = state_for(rows[0])
+    state["field_data"]["routed_experts"] = rows
+    payload = packed(state)
+    assert (b"_rebuild_device_tensor_from_numpy" in payload) != overlap
+    actual, expected = pickle.loads(payload), pickle.loads(pickle.dumps(state))
+    actual["field_data"]["routed_experts"][0].fill_(99)
+    expected["field_data"]["routed_experts"][0].fill_(99)
+    for index in rows:
+        assert torch.equal(
+            actual["field_data"]["routed_experts"][index], expected["field_data"]["routed_experts"][index]
+        )
 
 
 def test_checkpoint_without_routes_keeps_ordinary_values():
@@ -224,3 +245,104 @@ def test_matched_serialization_and_fsync_cost(tmp_path):
         del restored, payload
     assert measurements["packed_bytes"] < measurements["legacy_bytes"] * 0.6
     print("CHECKPOINT_ROUTE_BENCH " + json.dumps(measurements, sort_keys=True))
+
+
+@pytest.mark.parametrize("layout", ["rows", "nested", "dense"])
+def test_public_transport_put_save_route_eligibility(tmp_path, layout):
+    rows = [torch.randint(0, 16, (32768 + index * (layout != "dense"), 40, 1), dtype=torch.int16) for index in range(4)]
+    carrier = rows
+    if layout == "nested":
+        carrier = torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+    elif layout == "dense":
+        carrier = torch.stack(rows)
+    message = ZMQMessage.create(
+        ZMQRequestType.PUT_DATA, "test", {"global_indexes": list(range(4)), "data": {"routed_experts": carrier}}
+    )
+    started = time.perf_counter()
+    received = ZMQMessage.deserialize(message.serialize())
+    costs = {"wire_encode_decode_s": time.perf_counter() - started}
+    actor = unit()
+    started = time.perf_counter()
+    assert actor._handle_put(received).request_type == ZMQRequestType.PUT_DATA_RESPONSE
+    costs["put_s"] = time.perf_counter() - started
+    values = actor.storage_data.field_data["routed_experts"]
+    state = state_for(values[0])
+    state["field_data"]["routed_experts"], state["active_keys"] = values, set(values)
+    started = time.perf_counter()
+    legacy = pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL)
+    costs["legacy_serialize_s"] = time.perf_counter() - started
+    started = time.perf_counter()
+    assert all(value.numpy().min() >= 0 and value.numpy().max() <= 255 for value in values.values())
+    costs["range_check_s"] = time.perf_counter() - started
+    started = time.perf_counter()
+    narrow = [value.numpy().astype(np.uint8) for value in values.values()]
+    costs["narrow_copy_s"] = time.perf_counter() - started
+    del narrow
+    started = time.perf_counter()
+    direct = packed(state)
+    costs["packed_serialize_s"] = time.perf_counter() - started
+    path = tmp_path / "transport.pkl"
+    started = time.perf_counter()
+    assert actor._handle_save_checkpoint(request(path)).body["failure"] is None
+    costs["packed_handler_serialize_write_fsync_s"] = time.perf_counter() - started
+    payload = path.read_bytes()
+    assert b"_rebuild_device_tensor_from_numpy" in payload
+    assert len(payload) < len(legacy) * 0.6
+    restored = pickle.loads(payload)["field_data"]["routed_experts"]
+    ordinary = pickle.loads(legacy)["field_data"]["routed_experts"]
+    for index, expected in enumerate(rows):
+        assert restored[index].dtype == expected.dtype and restored[index].shape == expected.shape
+        assert torch.equal(restored[index], expected)
+    for index in restored:
+        for other in restored:
+            assert (restored[index] is restored[other]) == (ordinary[index] is ordinary[other])
+            assert (restored[index].untyped_storage().data_ptr() == restored[other].untyped_storage().data_ptr()) == (
+                ordinary[index].untyped_storage().data_ptr() == ordinary[other].untyped_storage().data_ptr()
+            )
+    restored[0].fill_(99)
+    ordinary[0].fill_(99)
+    assert all(torch.equal(restored[index], ordinary[index]) for index in restored)
+    loaded = unit()
+    assert loaded._handle_load_checkpoint(request(path)).body["success"]
+    for index, expected in enumerate(rows):
+        assert torch.equal(loaded.storage_data.field_data["routed_experts"][index], expected)
+    legacy_path = tmp_path / "legacy.pkl"
+    legacy_path.write_bytes(legacy)
+    code = (
+        "import pickle,sys,torch; a=pickle.load(open(sys.argv[1],'rb')); b=pickle.load(open(sys.argv[2],'rb')); "
+        "assert a['active_keys']==b['active_keys']; "
+        "a=a['field_data']['routed_experts']; b=b['field_data']['routed_experts']; "
+        "assert a.keys()==b.keys(); "
+        "assert all(a[k].dtype==b[k].dtype and a[k].shape==b[k].shape and torch.equal(a[k],b[k]) for k in a)"
+    )
+    subprocess.run([sys.executable, "-I", "-c", code, str(path), str(legacy_path)], check=True, timeout=30)
+    for mode, data in (("legacy", legacy), ("packed", direct)):
+        root = os.environ.get("CHECKPOINT_BENCH_WRITE_ROOT", str(tmp_path))
+        with tempfile.TemporaryDirectory(prefix="route-wire-", dir=root) as directory:
+            started = time.perf_counter()
+            with open(os.path.join(directory, "payload.pkl"), "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            costs[mode + "_write_flush_fsync_s"] = time.perf_counter() - started
+    print(
+        "TRANSPORT_ROUTE_PACKING "
+        + json.dumps(
+            {
+                "layout": layout,
+                "legacy_bytes": len(legacy),
+                "saved_bytes": len(payload),
+                "packed": b"_rebuild_device_tensor_from_numpy" in payload,
+                "costs": costs,
+                "rows": [
+                    {
+                        "view": value._base is not None,
+                        "offset": value.storage_offset(),
+                        "logical_bytes": value.nbytes,
+                        "backing_bytes": value.untyped_storage().nbytes(),
+                    }
+                    for value in values.values()
+                ],
+            }
+        )
+    )

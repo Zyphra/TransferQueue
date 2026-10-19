@@ -53,7 +53,7 @@ TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
 
 
 class _CheckpointPickler(pickle.Pickler):
-    """Narrow owned route payloads on disk while ordinary readers restore int16."""
+    """Narrow nonoverlapping route cells while ordinary readers restore int16."""
 
     def __init__(self, stream, state):
         super().__init__(stream, protocol=pickle.HIGHEST_PROTOCOL)
@@ -72,7 +72,7 @@ class _CheckpointPickler(pickle.Pickler):
                     break
                 storage = value.untyped_storage()
                 identity = (storage.data_ptr(), storage.nbytes())
-                owners.setdefault(identity, set()).add(id(value))
+                owners.setdefault(identity, []).append(value)
             elif type(value) is dict:
                 pending.extend(value.keys())
                 pending.extend(value.values())
@@ -83,8 +83,16 @@ class _CheckpointPickler(pickle.Pickler):
                 self.routes.clear()
                 break
         for aliases in owners.values():
-            if len(aliases) > 1:
-                self.routes.difference_update(aliases)
+            if len(aliases) <= 1:
+                continue
+            # Storage puts unbind dense/jagged batches into disjoint row views.
+            # Overlap or another field's view must retain ordinary serialization.
+            route_rows = all(
+                id(value) in self.routes and value.dtype == torch.int16 and value.is_contiguous() for value in aliases
+            )
+            spans = sorted((value.storage_offset(), value.storage_offset() + value.numel()) for value in aliases)
+            if not route_rows or any(left[1] > right[0] for left, right in zip(spans, spans[1:], strict=False)):
+                self.routes.difference_update(id(value) for value in aliases)
 
     def reducer_override(self, value):
         if id(value) not in self.routes:
@@ -93,9 +101,6 @@ class _CheckpointPickler(pickle.Pickler):
             type(value) is not torch.Tensor
             or value.dtype != torch.int16
             or not value.is_contiguous()
-            or value._base is not None
-            or value.storage_offset() != 0
-            or value.untyped_storage().nbytes() != value.numel() * value.element_size()
             or value.is_neg()
             or value.__dict__
             or any(name is not None for name in value.names)
