@@ -17,6 +17,7 @@
 # This implementation is inspired by https://github.com/vllm-project/vllm/blob/main/vllm/v1/serial_utils.py
 
 
+import math
 import pickle
 import struct
 import warnings
@@ -303,6 +304,8 @@ class MsgpackDecoder:
         torch_dtype = getattr(torch, dtype)
 
         if not buffer:  # Handle empty tensors
+            if math.prod(shape) != 0:
+                raise ValueError("empty payload for nonempty tensor shape")
             return torch.empty(shape, dtype=torch_dtype)
 
         # Create uint8 tensor from buffer, then view as original dtype and reshape
@@ -331,6 +334,8 @@ class MsgpackDecoder:
         np_dtype = np.dtype(dtype_str)
 
         if not buffer:  # empty array
+            if math.prod(shape) != 0:
+                raise ValueError("empty payload for nonempty array shape")
             return np.empty(shape, dtype=np_dtype)
 
         # Reconstruct from raw bytes: uint8 view → reinterpret as original dtype
