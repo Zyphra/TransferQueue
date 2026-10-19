@@ -54,7 +54,13 @@ _TQ_CONFIG = OmegaConf.create(
 @pytest.fixture(scope="module")
 def ray_init():
     if not ray.is_initialized():
-        ray.init(namespace="TestCheckpointE2E")
+        ray.init(
+            address="local",
+            num_cpus=4,
+            num_gpus=0,
+            object_store_memory=256 * 1024 * 1024,
+            namespace="TestCheckpointE2E",
+        )
     yield
     if ray.is_initialized():
         ray.shutdown()
