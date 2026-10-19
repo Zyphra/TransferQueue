@@ -224,3 +224,50 @@ def test_matched_serialization_and_fsync_cost(tmp_path):
         del restored, payload
     assert measurements["packed_bytes"] < measurements["legacy_bytes"] * 0.6
     print("CHECKPOINT_ROUTE_BENCH " + json.dumps(measurements, sort_keys=True))
+
+
+@pytest.mark.parametrize("layout", ["rows", "nested", "dense"])
+def test_public_transport_put_save_route_eligibility(tmp_path, layout):
+    rows = [torch.randint(0, 16, (128 + index * (layout != "dense"), 40, 1), dtype=torch.int16) for index in range(4)]
+    carrier = rows
+    if layout == "nested":
+        carrier = torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+    elif layout == "dense":
+        carrier = torch.stack(rows)
+    message = ZMQMessage.create(
+        ZMQRequestType.PUT_DATA, "test", {"global_indexes": list(range(4)), "data": {"routed_experts": carrier}}
+    )
+    received = ZMQMessage.deserialize(message.serialize())
+    actor = unit()
+    assert actor._handle_put(received).request_type == ZMQRequestType.PUT_DATA_RESPONSE
+    values = actor.storage_data.field_data["routed_experts"]
+    state = state_for(values[0])
+    state["field_data"]["routed_experts"], state["active_keys"] = values, set(values)
+    legacy = pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL)
+    path = tmp_path / "transport.pkl"
+    assert actor._handle_save_checkpoint(request(path)).body["failure"] is None
+    payload = path.read_bytes()
+    restored = pickle.loads(payload)["field_data"]["routed_experts"]
+    for index, expected in enumerate(rows):
+        assert restored[index].dtype == expected.dtype and restored[index].shape == expected.shape
+        assert torch.equal(restored[index], expected)
+    print(
+        "TRANSPORT_ROUTE_PACKING "
+        + json.dumps(
+            {
+                "layout": layout,
+                "legacy_bytes": len(legacy),
+                "saved_bytes": len(payload),
+                "packed": b"_rebuild_device_tensor_from_numpy" in payload,
+                "rows": [
+                    {
+                        "view": value._base is not None,
+                        "offset": value.storage_offset(),
+                        "logical_bytes": value.nbytes,
+                        "backing_bytes": value.untyped_storage().nbytes(),
+                    }
+                    for value in values.values()
+                ],
+            }
+        )
+    )
