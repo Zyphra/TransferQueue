@@ -351,6 +351,16 @@ Please kindly cite our paper if you find this repo is useful:
 
 ### Bounded asynchronous checkpoint storage
 
+For detached SimpleStorage saves, committed `metadata.json` includes an optional
+`storage_checkpoint` receipt: aggregate async/fallback mode and the existing
+per-unit ID, IP, preparation flag, accounted retained bytes (or `null` when
+unknown), and divided byte cap. It uses the preparation replies, with no payload
+read or additional RPC. The receipt is limited to 256 units and fixed primitive
+fields; invalid diagnostics are omitted. Its absence means mode is unknown.
+Only publication of the checkpoint attests durability; receipt construction is
+best-effort, while preparation, writes, metadata persistence and fsync retain
+their existing failures. The receipt is not an RSS or free-memory measurement.
+
 `save_checkpoint(..., async_storage=True, max_snapshot_bytes=...)` keeps the
 controller and sampler cut synchronous, captures replace-only SimpleStorage
 payload references, then returns a future for durable storage and publication.
