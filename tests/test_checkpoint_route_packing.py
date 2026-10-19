@@ -84,8 +84,13 @@ def test_unsupported_or_shared_backing_uses_normal_pickle(kind):
     restored = pickle.loads(payload)["field_data"]
     assert torch.equal(restored["routed_experts"][0], route)
     if kind in ("alias", "nested_alias"):
+        baseline = pickle.loads(pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL))["field_data"]
         alias = restored["alias"][0] if kind == "alias" else restored["nested"][0]["alias"]
-        assert alias.untyped_storage().data_ptr() == restored["routed_experts"][0].untyped_storage().data_ptr()
+        old_alias = baseline["alias"][0] if kind == "alias" else baseline["nested"][0]["alias"]
+        assert torch.equal(alias, old_alias) and alias.shape == old_alias.shape and alias.dtype == old_alias.dtype
+        assert (alias.untyped_storage().data_ptr() == restored["routed_experts"][0].untyped_storage().data_ptr()) == (
+            old_alias.untyped_storage().data_ptr() == baseline["routed_experts"][0].untyped_storage().data_ptr()
+        )
 
 
 def test_same_tensor_object_keeps_identity_across_fields():
