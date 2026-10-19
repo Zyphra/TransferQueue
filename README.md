@@ -356,8 +356,11 @@ controller and sampler cut synchronous, captures replace-only SimpleStorage
 payload references, then returns a future for durable storage and publication.
 Quiesce existing ready-row mutations through capture; fresh append-only producers
 may continue. Join the future before publishing an enclosing checkpoint or
-closing TransferQueue. Only one save may be pending. Unaccountable payloads or a
-per-unit retention estimate above the divided byte budget use synchronous writes.
+closing TransferQueue. Only one save may be pending. The payload frontier uses
+ownership from the snapshotted partitions, including recycled indexes. The legacy
+`allocated_indexes` metadata is preserved but does not define that frontier.
+Unaccountable payloads or a per-unit retention estimate above the divided byte
+budget use synchronous writes.
 This budget bounds accounted retained stores and map estimates, not process RSS
 or serialization scratch space. Other backends and the default API stay
 synchronous. Writer failure leaves staging uncommitted and prevents another save

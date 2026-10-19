@@ -2219,7 +2219,9 @@ class TransferQueueController:
                 os.fsync(f.fileno())
             logger.info(f"[{self.controller_id}]: dumped to {path}")
             if return_frontier:
-                return sorted(state["index_manager"]["allocated_indexes"])
+                # Recycled indexes can be absent from the legacy allocated set.
+                # Use ownership from the same detached controller snapshot.
+                return sorted(set().union(*state["index_manager"]["partition_to_indexes"].values()))
         except Exception as e:
             raise RuntimeError(f"[{self.controller_id}]: save checkpoint failed: {e}") from e
 
