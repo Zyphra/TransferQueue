@@ -91,6 +91,7 @@ class _CheckpointPickler(pickle.Pickler):
             type(value) is not torch.Tensor
             or value.dtype != torch.int16
             or not value.is_contiguous()
+            or value._base is not None
             or value.storage_offset() != 0
             or value.untyped_storage().nbytes() != value.numel() * value.element_size()
             or value.is_neg()

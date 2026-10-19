@@ -60,12 +60,16 @@ def test_exact_dtype_shape_values_and_range_fallback(values):
     assert (b"_rebuild_device_tensor_from_numpy" in payload) == all(0 <= value <= 255 for value in values)
 
 
-@pytest.mark.parametrize("kind", ["view", "transpose", "alias", "nested_alias", "numpy_alias", "opaque", "float"])
+@pytest.mark.parametrize(
+    "kind", ["view", "full_view", "transpose", "alias", "nested_alias", "numpy_alias", "opaque", "float"]
+)
 def test_unsupported_or_shared_backing_uses_normal_pickle(kind):
     base = torch.arange(16, dtype=torch.int16).reshape(4, 4).clone()
     route, other = base, {}
     if kind == "view":
         route = base[:2]
+    elif kind == "full_view":
+        route = base.view(-1)
     elif kind == "transpose":
         route = base.T
     elif kind == "alias":
