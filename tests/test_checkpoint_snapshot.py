@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from transfer_queue.controller import TransferQueueController
+from transfer_queue.controller import DataPartitionStatus, PartitionIndexManager, TransferQueueController
 from transfer_queue.storage.simple_storage import StorageUnitData
 
 
@@ -57,6 +57,42 @@ def test_controller_freezes_sampler_before_serialization(tmp_path, monkeypatch):
     with path.open("rb") as stream:
         assert pickle.load(stream)["sampler"] == {"cursor": [3]}
     assert sampler_state == {"cursor": [9]}
+
+
+def test_controller_frontier_keeps_recycled_indexes_at_the_saved_cut(tmp_path, monkeypatch):
+    manager = PartitionIndexManager()
+    assert manager.allocate_indexes("retired", 2) == [0, 1]
+    manager.release_partition("retired")
+    assert manager.allocate_indexes("train", 1) == [0]
+    assert manager.allocate_indexes("other", 2) == [1, 2]
+    assert manager.allocated_indexes == {2}
+    impl = TransferQueueController.__ray_metadata__.modified_class
+    controller = object.__new__(impl)
+    controller.controller_id, controller.index_manager = "frontier-control", manager
+    controller.partitions = {
+        name: DataPartitionStatus(partition_id=name, global_indexes=set(indexes))
+        for name, indexes in manager.partition_to_indexes.items()
+    }
+    sampler = {"cursor": [17]}
+    controller.sampler = SimpleNamespace(save_checkpoint=lambda: sampler)
+    original_dump = pickle.dump
+
+    def append_after_cut(state, stream, **kwargs):
+        manager.allocate_indexes("after-cut", 1)
+        sampler["cursor"][0] = 99
+        return original_dump(state, stream, **kwargs)
+
+    monkeypatch.setattr(pickle, "dump", append_after_cut)
+    path = tmp_path / "controller.pkl"
+    frontier = controller.save_checkpoint(str(path), return_frontier=True)
+    with path.open("rb") as stream:
+        saved = pickle.load(stream)
+    assert frontier == [0, 1, 2]
+    assert set(frontier) == set().union(*saved["index_manager"]["partition_to_indexes"].values())
+    assert saved["index_manager"]["allocated_indexes"] == {2}
+    assert saved["sampler"] == {"cursor": [17]}
+    assert manager.partition_to_indexes["after-cut"] == {3}
+    assert manager.allocated_indexes == {2, 3}
 
 
 @pytest.fixture(scope="module")

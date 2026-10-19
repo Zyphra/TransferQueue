@@ -144,14 +144,53 @@ def test_missing_produced_field_refuses_fresh_restore(services, tmp_path, monkey
     assert ray.get(interface._TQ_CONTROLLER.list_partitions.remote()) == []
 
 
-def test_reused_index_and_empty_field_mapping_restore(services, tmp_path):
-    put("old", field="cleared")
+@pytest.mark.parametrize("async_storage", [False, True], ids=["sync", "async"])
+def test_reused_index_and_empty_field_mapping_restore(services, tmp_path, async_storage):
+    put("old", value=1)
     tq.kv_clear(keys=["old"], partition_id="train")
-    put("new", value=5)
+    put("new", value=101)
+    put("new", field="mask", value=7)
+    put("other", partition="validation", value=202)
+    old_units = {actor._actor_id for actor in interface._TQ_STORAGE["SimpleStorage"].values()}
     path = tmp_path / "checkpoint"
-    tq.save_checkpoint(path)
+    future = tq.save_checkpoint(path, async_storage=async_storage, max_snapshot_bytes=1024 * 1024)
+    if future is not None:
+        future.result(timeout=30)
+    with (path / "controller_state.pkl").open("rb") as stream:
+        saved = pickle.load(stream)
+    put("new", value=999)
+    tq.kv_clear(keys=["new"], partition_id="train")
     fresh_restore(services, path)
-    assert tq.kv_batch_get(keys=["new"], partition_id="train")["value"].unbind()[0].item() == 5
+    assert not old_units & {actor._actor_id for actor in interface._TQ_STORAGE["SimpleStorage"].values()}
+    readback = tmp_path / "restored-controller.pkl"
+    tq.get_client().save_controller_checkpoint(str(readback))
+    with readback.open("rb") as stream:
+        restored = pickle.load(stream)
+    assert restored["controller_id"] == saved["controller_id"]
+    assert restored["index_manager"] == saved["index_manager"]
+    assert restored["sampler"] == saved["sampler"]
+    assert set(restored["partitions"]) == set(saved["partitions"])
+    for name, before in saved["partitions"].items():
+        before, after = vars(before).copy(), vars(restored["partitions"][name]).copy()
+        assert torch.equal(before.pop("production_status"), after.pop("production_status"))
+        consumed_before, consumed_after = before.pop("consumption_status"), after.pop("consumption_status")
+        assert set(consumed_before) == set(consumed_after)
+        for task in consumed_before:
+            assert torch.equal(consumed_before[task], consumed_after[task])
+        assert before == after
+    values = tq.kv_batch_get(keys=["new"], partition_id="train")
+    assert values["value"].unbind()[0].item() == 101
+    assert values["mask"].unbind()[0].item() == 7
+    assert tq.kv_batch_get(keys=["other"], partition_id="validation")["value"].unbind()[0].item() == 202
+    for position, state in enumerate(physical_state(tmp_path / "restored")):
+        expected = {}
+        for partition in saved["partitions"].values():
+            for field, metadata in partition.field_metadata.items():
+                indexes = {index for index in metadata.global_indexes if index % 2 == position}
+                if indexes:
+                    expected.setdefault(field, set()).update(indexes)
+        assert {field: set(rows) for field, rows in state["field_data"].items()} == expected
+        assert state["active_keys"] == set().union(*expected.values())
 
 
 @pytest.mark.parametrize("positions", [[0, 0], [-1, 1]])
