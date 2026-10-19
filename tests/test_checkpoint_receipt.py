@@ -18,6 +18,10 @@ from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleSt
 
 def manager_with_replies(*, fallback=False):
     manager = object.__new__(AsyncSimpleStorageManager)
+    manager.storage_manager_id = "receipt-test-manager"
+    manager.controller_handshake_socket = None
+    manager._owns_zmq_context = False
+    manager.zmq_context = None
     manager.storage_unit_infos = {f"unit-{index}": SimpleNamespace(ip=f"192.0.2.{index + 1}") for index in range(8)}
     replies = {
         key: {"prepared": not (fallback and index == 7), "retained_bytes": None if index == 7 else index + 10}
