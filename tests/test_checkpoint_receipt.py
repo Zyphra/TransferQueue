@@ -136,9 +136,12 @@ def test_committed_receipt_preserves_future_contract_and_durable_order(tmp_path,
 def test_optional_receipt_failure_still_commits(tmp_path, monkeypatch, failure):
     install_client(monkeypatch, invalid_receipt=failure == "invalid_primitives")
     if failure == "construction":
+        original_dumps = interface.json.dumps
 
-        def fail_receipt(*args, **kwargs):
-            raise ValueError("receipt")
+        def fail_receipt(value, *args, **kwargs):
+            if isinstance(value, dict) and "storage_units" in value:
+                raise ValueError("receipt")
+            return original_dumps(value, *args, **kwargs)
 
         monkeypatch.setattr(interface.json, "dumps", fail_receipt)
     path = tmp_path / "cut"
