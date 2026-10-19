@@ -981,6 +981,62 @@ _METADATA_FILE = "metadata.json"
 _CONTROLLER_FILE = "controller_state.pkl"
 _CHECKPOINT_LOCK = Lock()
 _PENDING_CHECKPOINT: Future | None = None
+_PENDING_CHECKPOINT_DIR: Path | None = None
+
+
+class CheckpointStorageError(RuntimeError):
+    """A known payload I/O failure or deadline; settlement is queried separately."""
+
+    def __init__(self, message, *, failures=(), timed_out=False):
+        super().__init__(message)
+        self.failures = tuple(failures)
+        self.timed_out = timed_out
+        self.checkpoint_future = None
+
+
+class CheckpointStorageTimeoutError(CheckpointStorageError, TimeoutError):
+    """A storage deadline does not attest that its writers have settled."""
+
+
+def checkpoint_status(checkpoint_dir: str | Path, future: Future) -> dict:
+    """Observe owned writers without publishing or clearing a failed save.
+
+    A completed Future alone is not settlement: a timeout or one failed unit
+    can precede other unit writers. Unknown transport/writer errors still raise.
+    """
+    with _CHECKPOINT_LOCK:
+        path = Path(checkpoint_dir)
+        if future is not _PENDING_CHECKPOINT or path != _PENDING_CHECKPOINT_DIR:
+            raise ValueError("checkpoint status does not identify the owned pending save")
+        if not future.done():
+            return {"settled": False}
+        error = future.exception()
+        if error is None:
+            return {"settled": True}
+        if not isinstance(error, CheckpointStorageError):
+            raise error
+        result = _maybe_create_tq_client().save_storage_checkpoint(
+            str(path.parent / f"{path.name}.tmp"), phase="status", publish_manifest=False
+        )
+        if any(not item["storage_io"] for item in result["failures"]):
+            raise RuntimeError(f"Non-storage checkpoint failure: {result['failures']}") from error
+        return {"settled": result["done"]}
+
+
+def retire_checkpoint(checkpoint_dir: str | Path, future: Future) -> None:
+    """Release failed-save bookkeeping after the caller settles the whole cut.
+
+    This never deletes files. The enclosing checkpoint owner must disarm its
+    other writers and remove only its uncommitted partial cut before retiring.
+    """
+    global _PENDING_CHECKPOINT, _PENDING_CHECKPOINT_DIR
+    if not checkpoint_status(checkpoint_dir, future)["settled"]:
+        raise RuntimeError("cannot retire unsettled checkpoint writers")
+    with _CHECKPOINT_LOCK:
+        if future is not _PENDING_CHECKPOINT or Path(checkpoint_dir) != _PENDING_CHECKPOINT_DIR:
+            raise ValueError("checkpoint retirement does not identify the owned pending save")
+        _PENDING_CHECKPOINT = None
+        _PENDING_CHECKPOINT_DIR = None
 
 
 def _commit_checkpoint(tmp_dir: Path, checkpoint_dir: Path, old_dir: Path, metadata: dict) -> None:
@@ -1030,12 +1086,13 @@ def save_checkpoint(
     estimate above ``max_snapshot_bytes`` falls back to a synchronous write.
     The positive byte budget covers retained payload stores and map estimates,
     not a process RSS limit or pickle's transient memory. Only one save can be
-    pending; a failed save prevents another save in the same client process.
+    pending; a failed save prevents another cut until its enclosing owner has
+    settled every writer and explicitly retired the failed cut.
     Other storage backends retain their synchronous behavior. ``include_storage``
     can disable external-backend dumps; in-memory SimpleStorage always saves its
     payloads. ``metadata`` is copied into the existing metadata.json user section.
     """
-    global _PENDING_CHECKPOINT
+    global _PENDING_CHECKPOINT, _PENDING_CHECKPOINT_DIR
     if _TQ_CONTROLLER is None:
         raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")
     if async_storage:
@@ -1047,6 +1104,8 @@ def save_checkpoint(
     with _CHECKPOINT_LOCK:
         if _PENDING_CHECKPOINT is not None:
             _PENDING_CHECKPOINT.result(timeout=timeout_s)
+        _PENDING_CHECKPOINT = None
+        _PENDING_CHECKPOINT_DIR = None
         client = _maybe_create_tq_client()
         detached = async_storage and isinstance(client.storage_manager, AsyncSimpleStorageManager)
         if not include_storage and isinstance(client.storage_manager, AsyncSimpleStorageManager):
@@ -1071,6 +1130,7 @@ def save_checkpoint(
                     if detached:
                         # A failed fanout may already have started a subset of writers.
                         writers_started = True
+                        _PENDING_CHECKPOINT_DIR = checkpoint_dir
                         prepared = client.save_storage_checkpoint(
                             str(tmp_dir),
                             phase="prepare",
@@ -1078,7 +1138,16 @@ def save_checkpoint(
                             max_snapshot_bytes=max_snapshot_bytes,
                         )
                     else:
-                        client.save_storage_checkpoint(str(tmp_dir))
+                        if isinstance(client.storage_manager, AsyncSimpleStorageManager):
+                            writers_started = True
+                            _PENDING_CHECKPOINT_DIR = checkpoint_dir
+                        result = client.save_storage_checkpoint(str(tmp_dir))
+                        if result is not None and result["failures"]:
+                            if any(not item["storage_io"] for item in result["failures"]):
+                                raise RuntimeError(f"Non-storage checkpoint failure: {result['failures']}")
+                            raise CheckpointStorageError(
+                                f"TransferQueue payload I/O failed: {result['failures']}", failures=result["failures"]
+                            )
                 except NotImplementedError:
                     logger.warning("Storage backend does not support checkpoint; storage will not be saved.")
                     include_storage = False
@@ -1087,9 +1156,20 @@ def save_checkpoint(
             def finish():
                 if detached:
                     deadline = time.monotonic() + timeout_s
-                    while not client.save_storage_checkpoint(str(tmp_dir), phase="status")["done"]:
+                    while True:
+                        status = client.save_storage_checkpoint(str(tmp_dir), phase="status")
+                        if status["failures"]:
+                            if any(not item["storage_io"] for item in status["failures"]):
+                                raise RuntimeError(f"Non-storage checkpoint failure: {status['failures']}")
+                            raise CheckpointStorageError(
+                                f"TransferQueue payload I/O failed: {status['failures']}", failures=status["failures"]
+                            )
+                        if status["done"]:
+                            break
                         if time.monotonic() >= deadline:
-                            raise TimeoutError("TransferQueue storage checkpoint write timed out")
+                            raise CheckpointStorageTimeoutError(
+                                "TransferQueue storage checkpoint write timed out", timed_out=True
+                            )
                         time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
                 _commit_checkpoint(tmp_dir, checkpoint_dir, old_dir, meta_content)
 
@@ -1102,6 +1182,8 @@ def save_checkpoint(
                     try:
                         finish()
                     except BaseException as error:
+                        if isinstance(error, CheckpointStorageError):
+                            error.checkpoint_future = future
                         future.set_exception(error)
                     else:
                         future.set_result(None)
@@ -1109,6 +1191,7 @@ def save_checkpoint(
                 Thread(target=complete, name="TransferQueueCheckpoint", daemon=True).start()
                 return future
             finish()
+            _PENDING_CHECKPOINT_DIR = None
             return None
         except BaseException as error:
             if writers_started:
@@ -1117,6 +1200,10 @@ def save_checkpoint(
                 failed = Future()
                 failed.set_exception(error)
                 _PENDING_CHECKPOINT = failed
+                if isinstance(error, CheckpointStorageError):
+                    error.checkpoint_future = failed
+                    if async_storage:
+                        return failed
             elif tmp_dir.exists():
                 shutil.rmtree(tmp_dir)
             if old_dir.exists() and not checkpoint_dir.exists():

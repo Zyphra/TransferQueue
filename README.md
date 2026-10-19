@@ -361,3 +361,18 @@ or serialization scratch space. Other backends and the default API stay
 synchronous. Writer failure leaves staging uncommitted and prevents another save
 in that client process; allocation teardown owns an uninterruptible filesystem
 thread. Checkpoints require a shared filesystem for multiple nodes.
+
+An asynchronous SimpleStorage payload I/O failure raises `CheckpointStorageError`
+with the original storage-unit error type, message and errno. Synchronous payload
+I/O failure raises the same error with its exact owned `checkpoint_future`;
+a write deadline is
+also a `TimeoutError`. Neither a failed Future nor its deadline proves writer
+settlement. `checkpoint_status(path, future)` requires the exact owned Future and
+path and observes every storage unit without publishing manifests or recreating
+staging. Mixed non-I/O failures remain fatal. After all writers settle, the
+caller must disarm its other checkpoint components, remove only its uncommitted
+partial checkpoint, and call `retire_checkpoint(path, future)` before another
+cut. Retirement releases bookkeeping only: it never deletes files, commits a
+late writer, or chooses the caller's valid committed fallback. Failed/unknown
+ownership continues to reject another cut. Defaults and capture quiescence are
+unchanged; this is not a cancellation API or a process-memory bound.

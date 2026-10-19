@@ -614,6 +614,20 @@ class SimpleStorageUnit:
             and ``message`` containing the error string on failure.
         """
         path = data_parts.body["path"]
+
+        def failure_details(error):
+            return (
+                None
+                if error is None
+                else {
+                    "type": type(error).__qualname__,
+                    "module": type(error).__module__,
+                    "message": str(error),
+                    "errno": getattr(error, "errno", None),
+                    "storage_io": isinstance(error, OSError),
+                }
+            )
+
         try:
             phase = data_parts.body.get("phase", "save")
             if phase == "status":
@@ -621,12 +635,12 @@ class SimpleStorageUnit:
                     raise ValueError("checkpoint completion path does not match the pending snapshot")
                 future = self._checkpoint_future
                 done = future.done()
-                if done:
-                    future.result()
+                error = future.exception() if done else None
+                failure = failure_details(error)
                 return ZMQMessage.create(
                     request_type=ZMQRequestType.SAVE_STORAGE_CHECKPOINT_RESPONSE,
                     sender_id=self.storage_unit_id,
-                    body={"success": True, "done": done},
+                    body={"success": True, "done": done, "failure": failure},
                 )
             previous = getattr(self, "_checkpoint_future", None)
             if previous is not None and not previous.done():
@@ -655,9 +669,9 @@ class SimpleStorageUnit:
                 and retained_bytes is not None
                 and retained_bytes <= data_parts.body["max_snapshot_bytes"]
             )
+            future = Future()
+            self._checkpoint_future, self._checkpoint_path = future, path
             if prepared:
-                future = Future()
-                self._checkpoint_future, self._checkpoint_path = future, path
 
                 def background_write():
                     try:
@@ -671,14 +685,27 @@ class SimpleStorageUnit:
 
                 Thread(target=background_write, name="StorageCheckpointWriter", daemon=True).start()
             else:
-                write()
-                self._checkpoint_future, self._checkpoint_path = Future(), path
-                self._checkpoint_future.set_result(None)
+                try:
+                    write()
+                except BaseException as error:
+                    state.clear()
+                    future.set_exception(error)
+                    if phase != "prepare" and not isinstance(error, OSError):
+                        raise
+                else:
+                    state.clear()
+                    future.set_result(None)
             logger.info(f"[{self.storage_unit_id}]: checkpoint write accepted at {path}; async={prepared}")
             return ZMQMessage.create(
                 request_type=ZMQRequestType.SAVE_STORAGE_CHECKPOINT_RESPONSE,  # type: ignore[arg-type]
                 sender_id=self.storage_unit_id,
-                body={"success": True, "prepared": prepared, "done": not prepared, "retained_bytes": retained_bytes},
+                body={
+                    "success": True,
+                    "prepared": prepared,
+                    "done": not prepared,
+                    "retained_bytes": retained_bytes,
+                    "failure": failure_details(future.exception()) if future.done() else None,
+                },
             )
         except Exception as e:
             logger.error(f"[{self.storage_unit_id}]: save checkpoint failed: {e}")
