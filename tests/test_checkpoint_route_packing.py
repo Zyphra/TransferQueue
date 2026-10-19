@@ -48,7 +48,7 @@ def request(path, **body):
 
 @pytest.mark.parametrize("values", [[0, 1, 15, 255], [], [-1, 0], [0, 256], [-32768, 32767]])
 def test_exact_dtype_shape_values_and_range_fallback(values):
-    route = torch.tensor(values, dtype=torch.int16).reshape(-1, 1, 1)
+    route = torch.tensor(values, dtype=torch.int16).reshape(-1, 1, 1).clone()
     state = state_for(route, tokens=torch.tensor([19], dtype=torch.int64))
     payload = packed(state)
     restored = pickle.loads(payload)
@@ -101,6 +101,14 @@ def test_same_tensor_object_keeps_identity_across_fields():
     route = torch.arange(16, dtype=torch.int16)
     restored = pickle.loads(packed(state_for(route, duplicate=route)))["field_data"]
     assert restored["routed_experts"][0] is restored["duplicate"][0]
+
+
+def test_checkpoint_without_routes_keeps_ordinary_values():
+    state = state_for(torch.tensor([1], dtype=torch.int16), tokens=torch.arange(8))
+    del state["field_data"]["routed_experts"]
+    payload = packed(state)
+    assert b"_rebuild_device_tensor_from_numpy" not in payload
+    assert torch.equal(pickle.loads(payload)["field_data"]["tokens"][0], torch.arange(8))
 
 
 @pytest.mark.parametrize("legacy", [False, True])

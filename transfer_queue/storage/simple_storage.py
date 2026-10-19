@@ -58,6 +58,8 @@ class _CheckpointPickler(pickle.Pickler):
     def __init__(self, stream, state):
         super().__init__(stream, protocol=pickle.HIGHEST_PROTOCOL)
         self.routes = {id(value) for value in state["field_data"].get("routed_experts", {}).values()}
+        if not self.routes:
+            return
         pending, seen, owners = [state], set(), {}
         while pending:
             value = pending.pop()
