@@ -15,14 +15,18 @@
 
 import os
 import pickle
+import sys
 import time
 import weakref
+from concurrent.futures import Future
 from threading import Event, Thread
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+import numpy as np
 import psutil
 import ray
+import torch
 import zmq
 
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
@@ -134,6 +138,55 @@ class StorageUnitData:
             for key in keys:
                 self.field_data[f].pop(key, None)
         self._active_keys -= set(keys)
+
+    def checkpoint_snapshot(self, indexes: set[int]) -> tuple[dict, int | None]:
+        """Retain replace-only values without retaining the live field maps.
+
+        Count full backing stores, including tensor views. Unknown object ownership
+        selects the synchronous path instead of guessing a retention budget.
+        """
+        fields = {
+            name: {key: value for key, value in rows.items() if key in indexes}
+            for name, rows in self.field_data.items()
+        }
+        active = self._active_keys & indexes
+        pending, seen, stores, size = [fields, active], set(), set(), 0
+        while pending:
+            value = pending.pop()
+            if id(value) in seen:
+                continue
+            seen.add(id(value))
+            size += sys.getsizeof(value)
+            if isinstance(value, torch.Tensor):
+                if type(value) is not torch.Tensor or value.device.type != "cpu" or value.is_nested:
+                    return {"field_data": fields, "active_keys": active}, None
+                try:
+                    storage = value.untyped_storage()
+                    identity = (storage.data_ptr(), storage.nbytes())
+                    if identity not in stores:
+                        stores.add(identity)
+                        size += storage.nbytes() + 4096
+                except (RuntimeError, NotImplementedError):
+                    return {"field_data": fields, "active_keys": active}, None
+            elif isinstance(value, np.ndarray):
+                if type(value) is not np.ndarray or value.dtype.hasobject:
+                    return {"field_data": fields, "active_keys": active}, None
+                root = value
+                while isinstance(root.base, np.ndarray):
+                    root = root.base
+                if root.base is not None:
+                    return {"field_data": fields, "active_keys": active}, None
+                if id(root) not in stores:
+                    stores.add(id(root))
+                    size += root.nbytes
+            elif type(value) is dict:
+                pending.extend(value.keys())
+                pending.extend(value.values())
+            elif type(value) in (list, tuple, set, frozenset):
+                pending.extend(value)
+            elif type(value) not in (str, bytes, bytearray, int, float, bool, type(None)):
+                return {"field_data": fields, "active_keys": active}, None
+        return {"field_data": fields, "active_keys": active}, size
 
 
 @ray.remote(num_cpus=1)
@@ -562,19 +615,70 @@ class SimpleStorageUnit:
         """
         path = data_parts.body["path"]
         try:
+            phase = data_parts.body.get("phase", "save")
+            if phase == "status":
+                if path != getattr(self, "_checkpoint_path", None):
+                    raise ValueError("checkpoint completion path does not match the pending snapshot")
+                future = self._checkpoint_future
+                done = future.done()
+                if done:
+                    future.result()
+                return ZMQMessage.create(
+                    request_type=ZMQRequestType.SAVE_STORAGE_CHECKPOINT_RESPONSE,
+                    sender_id=self.storage_unit_id,
+                    body={"success": True, "done": done},
+                )
+            previous = getattr(self, "_checkpoint_future", None)
+            if previous is not None and not previous.done():
+                raise RuntimeError("one storage checkpoint is already pending")
             state = {
                 "storage_unit_id": self.storage_unit_id,
                 "storage_unit_size": self.storage_unit_size,
                 "field_data": self.storage_data.field_data,
                 "active_keys": self.storage_data._active_keys,
             }
-            with open(path, "wb") as f:
-                pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
-            logger.info(f"[{self.storage_unit_id}]: saved checkpoint to {path}")
+            retained_bytes = None
+            if phase == "prepare":
+                detached, retained_bytes = self.storage_data.checkpoint_snapshot(set(data_parts.body["indexes"]))
+                state.update(detached)
+            elif phase != "save":
+                raise ValueError("unknown checkpoint phase")
+
+            def write():
+                with open(path, "wb") as f:
+                    pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    f.flush()
+                    os.fsync(f.fileno())
+
+            prepared = (
+                phase == "prepare"
+                and retained_bytes is not None
+                and retained_bytes <= data_parts.body["max_snapshot_bytes"]
+            )
+            if prepared:
+                future = Future()
+                self._checkpoint_future, self._checkpoint_path = future, path
+
+                def background_write():
+                    try:
+                        write()
+                    except BaseException as error:
+                        state.clear()
+                        future.set_exception(error)
+                    else:
+                        state.clear()
+                        future.set_result(None)
+
+                Thread(target=background_write, name="StorageCheckpointWriter", daemon=True).start()
+            else:
+                write()
+                self._checkpoint_future, self._checkpoint_path = Future(), path
+                self._checkpoint_future.set_result(None)
+            logger.info(f"[{self.storage_unit_id}]: checkpoint write accepted at {path}; async={prepared}")
             return ZMQMessage.create(
                 request_type=ZMQRequestType.SAVE_STORAGE_CHECKPOINT_RESPONSE,  # type: ignore[arg-type]
                 sender_id=self.storage_unit_id,
-                body={"success": True},
+                body={"success": True, "prepared": prepared, "done": not prepared, "retained_bytes": retained_bytes},
             )
         except Exception as e:
             logger.error(f"[{self.storage_unit_id}]: save checkpoint failed: {e}")
