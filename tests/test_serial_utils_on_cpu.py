@@ -1230,3 +1230,47 @@ class TestPickleFallback:
                 if sock is not None and not sock.closed:
                     sock.close(linger=0)
             ctx.term()
+
+
+@pytest.mark.parametrize("shape", [(4,), (), (2, 3)])
+def test_tensor_rejects_empty_payload_for_nonempty_shape(shape):
+    frames = list(encode({"value": torch.zeros(shape, dtype=torch.float32)}))
+    assert len(frames) == 2
+    frames[1] = b""
+    with pytest.raises(ValueError, match="empty payload.*nonempty tensor"):
+        decode(frames)
+
+
+@pytest.mark.parametrize("shape", [(4,), (2, 3)])
+def test_numpy_rejects_empty_payload_for_nonempty_shape(shape):
+    frames = list(encode({"value": np.zeros(shape, dtype=np.float32)}))
+    assert len(frames) == 2
+    frames[1] = b""
+    with pytest.raises(ValueError, match="empty payload.*nonempty array"):
+        decode(frames)
+
+
+def test_numpy_scalar_keeps_pickle_fallback():
+    frames = list(encode({"value": np.zeros((), dtype=np.float32)}))
+    assert len(frames) == 1
+    value = decode(frames)["value"]
+    assert value.shape == () and value.dtype == np.float32 and value.item() == 0
+
+
+@pytest.mark.parametrize("shape", [(0,), (2, 0, 3)])
+def test_codec_preserves_zero_element_shapes(shape):
+    assert decode(encode({"value": torch.empty(shape)}))["value"].numel() == 0
+    assert decode(encode({"value": np.empty(shape, dtype=np.float32)}))["value"].size == 0
+
+
+@pytest.mark.parametrize("shape", [(), (1,), (2, 3), (0,), (2, 0, 3)])
+def test_codec_preserves_tensor_and_numpy_shape_dtype_values(shape):
+    count = int(np.prod(shape))
+    value = torch.arange(max(1, count), dtype=torch.float32)[:count].reshape(shape)
+    decoded = decode(encode({"value": value}))["value"]
+    assert decoded.shape == value.shape and decoded.dtype == value.dtype
+    assert torch.equal(decoded, value)
+    array = value.numpy()
+    decoded_array = decode(encode({"value": array}))["value"]
+    assert decoded_array.shape == array.shape and decoded_array.dtype == array.dtype
+    assert np.array_equal(decoded_array, array)

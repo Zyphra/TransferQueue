@@ -96,6 +96,8 @@ This data structure design is motivated by the computational characteristics of 
   <img src="https://github.com/TransferQueue/community_doc/blob/main/docs/data_plane.png?raw=true" width="70%">
 </p>
 
+The wire decoder rejects empty tensor or NumPy payload frames whose declared shape has nonzero elements. Legitimate zero-element shapes and NumPy scalar pickle serialization remain supported; a missing payload must never become uninitialized sample data.
+
 ### User Interface: High-Level & Low-Level APIs
 
 | Level | Tier | Style | Fine-Grained Access | Streaming | Sampler | Multiple-Backends | 
