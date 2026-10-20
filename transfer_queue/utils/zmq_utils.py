@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import socket
+import struct
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -23,12 +25,13 @@ from uuid import uuid4
 
 import psutil
 import ray
+import xxhash
 import zmq
 import zmq.asyncio
 
 from transfer_queue.utils.enum_utils import ExplicitEnum, Role
 from transfer_queue.utils.logging_utils import get_logger
-from transfer_queue.utils.serial_utils import decode, encode
+from transfer_queue.utils.serial_utils import decode, encode, locate_buffers
 
 logger = get_logger(__name__)
 
@@ -150,6 +153,65 @@ class ZMQMessageDecodeError(ValueError):
     """Raised when a received multipart message cannot be decoded into a ZMQMessage."""
 
 
+class ZMQMessageIntegrityError(ZMQMessageDecodeError):
+    """A received frame differs from the checksum its sender computed.
+
+    ``locations`` holds each bad frame's path in the message, e.g.
+    ``("body", "data", "field", row)``, or ``("frame", index)`` when the header
+    that maps frames to fields is itself unreadable.
+    """
+
+    def __init__(self, message: str, locations: Sequence[tuple] = ()):
+        super().__init__(message)
+        self.locations = list(locations)
+
+
+# Process-wide counts, so trainers can report how often reads needed a retry.
+_integrity_lock = threading.Lock()
+_integrity_counts = {"checksum_mismatches": 0, "retry_successes": 0}
+
+
+def count_integrity_event(name: str) -> None:
+    with _integrity_lock:
+        _integrity_counts[name] += 1
+
+
+def integrity_counts() -> dict[str, int]:
+    """Cumulative checksum mismatches and successful re-reads in this process."""
+    with _integrity_lock:
+        return dict(_integrity_counts)
+
+
+# Every message ends with one frame holding an xxh3-64 digest of each preceding
+# frame, so corruption anywhere between the sender's buffers and the receiver's
+# decode is detected before any tensor is built from the bytes.
+_CHECKSUM_MAGIC = b"TQX3"
+
+
+def _checksum_frame(frames: Sequence[Any]) -> bytes:
+    digests = [xxhash.xxh3_64_intdigest(frame) for frame in frames]
+    return struct.pack(f"<4s{len(digests)}Q", _CHECKSUM_MAGIC, *digests)
+
+
+def _verified_payload(frames: Sequence[Any]) -> list:
+    """Strip and check the checksum frame; raise ZMQMessageIntegrityError on any mismatch."""
+    payload, trailer = list(frames[:-1]), memoryview(frames[-1])
+    if trailer.nbytes != len(_CHECKSUM_MAGIC) + 8 * len(payload) or trailer[:4].tobytes() != _CHECKSUM_MAGIC:
+        count_integrity_event("checksum_mismatches")
+        raise ZMQMessageIntegrityError(f"checksum frame missing or malformed; {describe_frames(frames)}")
+    expected = struct.unpack_from(f"<{len(payload)}Q", trailer, len(_CHECKSUM_MAGIC))
+    bad = {i for i, frame in enumerate(payload) if xxhash.xxh3_64_intdigest(frame) != expected[i]}
+    if not bad:
+        return payload
+    count_integrity_event("checksum_mismatches")
+    paths = {} if 0 in bad else locate_buffers(payload, bad)
+    locations = [paths.get(i, ("frame", i)) for i in sorted(bad)]
+    shown = ", ".join("/".join(map(str, location)) for location in locations[:8])
+    raise ZMQMessageIntegrityError(
+        f"checksum mismatch in {len(bad)} of {len(payload)} frames: {shown}; {describe_frames(payload)}", locations
+    )
+
+
 def frame_nbytes(frame: Any) -> int | None:
     """Byte length of a single ZMQ frame, or None if the object exposes no buffer."""
     try:
@@ -212,13 +274,15 @@ class ZMQMessage:
             "timestamp": self.timestamp,
             "body": self.body,
         }
-        return encode(msg_dict)
+        frames = encode(msg_dict)
+        return [*frames, _checksum_frame(frames)]
 
     @classmethod
     def deserialize(cls, frames: list) -> "ZMQMessage":
-        """Deserialize: choose decoding path based on the first frame marker (zero-copy or pickle fallback)."""
+        """Verify frame checksums, then decode via the zero-copy or pickle-fallback path."""
         if not frames:
             raise ValueError("Empty frames received")
+        frames = _verified_payload(frames)
 
         # Frame 0 is always the msgpack header; buffers for tensors/ndarrays follow it. A
         # zero-length frame 0 therefore means the multipart boundaries have shifted rather
