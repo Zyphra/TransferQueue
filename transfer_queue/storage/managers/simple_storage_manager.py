@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import functools
 import ipaddress
 import os
 import pickle
@@ -34,14 +35,18 @@ from transfer_queue.storage.managers.base import StorageManager, StorageManagerF
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
+    ZMQMessageIntegrityError,
     ZMQRequestType,
     ZMQServerInfo,
+    count_integrity_event,
     with_zmq_socket,
 )
 
 logger = get_logger(__name__)
 
 TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT", 200))  # seconds
+# Repeats of a put or get whose bytes failed their checksum in either direction.
+TQ_INTEGRITY_RETRIES = int(os.environ.get("TQ_INTEGRITY_RETRIES", 3))
 
 _SU_SUBDIR = "simple_storage"
 _SU_INFO_FILE = "storage_unit_info.json"
@@ -57,6 +62,19 @@ with_storage_unit_socket = with_zmq_socket(
     resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
     timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT,
 )
+
+
+def _describe_locations(locations: Sequence[tuple], global_indexes: Sequence[int]) -> str:
+    """Name corrupt frames by field and global index where the message layout allows."""
+    names = []
+    for location in locations[:8]:
+        if len(location) == 4 and location[:2] == ("body", "data") and isinstance(location[3], int):
+            names.append(f"field={location[2]!r} global_index={global_indexes[location[3]]}")
+        elif len(location) >= 3 and location[:2] == ("body", "data"):
+            names.append(f"field={location[2]!r}")
+        else:
+            names.append("/".join(map(str, location)))
+    return ", ".join(names) or "request rejected by the storage unit"
 
 
 async def _settle_storage_operations(operations: Sequence[Awaitable[Any]]) -> None:
@@ -344,11 +362,17 @@ class AsyncSimpleStorageManager(StorageManager):
 
         routing = self._group_by_hash(metadata.global_indexes)
         tasks = [
-            self._put_to_single_storage_unit(
+            self._with_integrity_retries(
+                functools.partial(
+                    self._put_to_single_storage_unit,
+                    group.global_indexes,
+                    {f: self._select_by_positions(data[f], group.batch_positions) for f in data.keys()},
+                    target_storage_unit=su_id,
+                    data_parser=data_parser,
+                ),
+                "put to",
+                su_id,
                 group.global_indexes,
-                {f: self._select_by_positions(data[f], group.batch_positions) for f in data.keys()},
-                target_storage_unit=su_id,
-                data_parser=data_parser,
             )
             for su_id, group in routing.items()
         ]
@@ -398,6 +422,9 @@ class AsyncSimpleStorageManager(StorageManager):
             messages = await socket.recv_multipart(copy=False)
             response_msg = ZMQMessage.deserialize(messages)
 
+            if response_msg.body.get("integrity_error"):
+                count_integrity_event("checksum_mismatches")
+                raise ZMQMessageIntegrityError(response_msg.body["message"])
             if response_msg.request_type != ZMQRequestType.PUT_DATA_RESPONSE:
                 raise RuntimeError(
                     f"Failed to put data to storage unit {target_storage_unit}: "
@@ -413,12 +440,52 @@ class AsyncSimpleStorageManager(StorageManager):
             raise RuntimeError(
                 f"ZMQ recv timeout ({timeout_sec}s) during put to storage unit {target_storage_unit}"
             ) from e
+        except ZMQMessageIntegrityError:
+            raise
         except Exception as e:
             logger.error(
                 f"[{self.storage_manager_id}]: Unexpected error during put to storage unit "
                 f"{target_storage_unit}: {type(e).__name__}: {e}"
             )
             raise RuntimeError(f"Error in put to storage unit {target_storage_unit}: {type(e).__name__}: {e}") from e
+
+    async def _with_integrity_retries(
+        self,
+        request: Callable[[], Awaitable[Any]],
+        action: str,
+        target_storage_unit: str,
+        global_indexes: list[int],
+    ) -> Any:
+        """Repeat a storage-unit request whose bytes failed their checksum, up to TQ_INTEGRITY_RETRIES times.
+
+        Puts overwrite by global index and gets are reads, so repeating either is safe.
+        Each repeat opens a fresh socket; the error after the last one names the unit,
+        fields and global indexes that never arrived intact.
+        """
+        attempts = TQ_INTEGRITY_RETRIES + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                result = await request()
+            except ZMQMessageIntegrityError as error:
+                where = _describe_locations(error.locations, global_indexes)
+                if attempt == attempts:
+                    raise ZMQMessageIntegrityError(
+                        f"[{self.storage_manager_id}]: {action} storage unit {target_storage_unit} failed its "
+                        f"checksum on all {attempts} attempts ({where}): {error}",
+                        error.locations,
+                    ) from error
+                logger.warning(
+                    f"[{self.storage_manager_id}]: checksum mismatch on {action} storage unit "
+                    f"{target_storage_unit}, attempt {attempt} of {attempts} ({where}): {error}"
+                )
+                continue
+            if attempt > 1:
+                count_integrity_event("retry_successes")
+                logger.warning(
+                    f"[{self.storage_manager_id}]: {action} storage unit {target_storage_unit} "
+                    f"passed its checksum on attempt {attempt}"
+                )
+            return result
 
     @staticmethod
     def _pack_field_values(values: list) -> torch.Tensor | NonTensorStack:
@@ -491,7 +558,17 @@ class AsyncSimpleStorageManager(StorageManager):
         routing = self._group_by_hash(metadata.global_indexes)
 
         tasks = [
-            self._get_from_single_storage_unit(group.global_indexes, metadata.field_names, target_storage_unit=su_id)
+            self._with_integrity_retries(
+                functools.partial(
+                    self._get_from_single_storage_unit,
+                    group.global_indexes,
+                    metadata.field_names,
+                    target_storage_unit=su_id,
+                ),
+                "get from",
+                su_id,
+                group.global_indexes,
+            )
             for su_id, group in routing.items()
         ]
         try:
@@ -539,6 +616,9 @@ class AsyncSimpleStorageManager(StorageManager):
             messages = await socket.recv_multipart(copy=False)
             response_msg = ZMQMessage.deserialize(messages)
 
+            if response_msg.body.get("integrity_error"):
+                count_integrity_event("checksum_mismatches")
+                raise ZMQMessageIntegrityError(response_msg.body["message"])
             if response_msg.request_type == ZMQRequestType.GET_DATA_RESPONSE:
                 storage_unit_data = response_msg.body["data"]
                 return fields, storage_unit_data
@@ -555,6 +635,8 @@ class AsyncSimpleStorageManager(StorageManager):
                 f"The storage unit may be overloaded or crashed."
             )
             raise RuntimeError(f"ZMQ recv timeout ({timeout_sec}s) from storage unit {target_storage_unit}") from e
+        except ZMQMessageIntegrityError:
+            raise
         except Exception as e:
             logger.error(
                 f"[{self.storage_manager_id}]: Unexpected error from storage unit "

@@ -1323,7 +1323,7 @@ class TestPickleFallback:
                 body={"partition_id": "p0", "offset": 2**70},
             )
             sent = msg.serialize()
-            assert len(sent) == 2, "expected the pickle fallback layout"
+            assert len(sent) == 3, "expected the pickle fallback layout plus its checksum frame"
             dealer.send_multipart(sent)
 
             assert router.poll(10_000), "message never arrived"

@@ -441,6 +441,36 @@ def decode(frames: list) -> Any:
     return _decoder.decode(frames)
 
 
+def locate_buffers(frames: Sequence[bytestr], indexes: set[int]) -> dict[int, tuple]:
+    """Map buffer frame indexes to their path in the encoded object, e.g. ``("body", "data", "f", 3)``.
+
+    Decodes only the msgpack header, so it never touches the buffers themselves; a
+    corrupt or pickled header, whose layout cannot be trusted, yields no paths.
+    """
+    if not frames or _is_pickle_fallback(frames[0]):
+        return {}
+
+    def ext_hook(code: int, data: memoryview) -> Any:
+        if code in (CUSTOM_TYPE_TENSOR, CUSTOM_TYPE_NUMPY):
+            return ("__tq_buffer__", pickle.loads(data)[2])
+        if code == CUSTOM_TYPE_NESTED_TENSOR:
+            return [("__tq_buffer__", meta[2]) for meta in pickle.loads(data)["tensors"]]
+        return None
+
+    found: dict[int, tuple] = {}
+    pending: list[tuple[tuple, Any]] = [((), msgpack.decode(frames[0], ext_hook=ext_hook))]
+    while pending:
+        path, node = pending.pop()
+        if isinstance(node, tuple) and len(node) == 2 and node[0] == "__tq_buffer__":
+            if node[1] in indexes:
+                found[node[1]] = path
+        elif isinstance(node, dict):
+            pending.extend(((*path, key), value) for key, value in node.items())
+        elif isinstance(node, list):
+            pending.extend(((*path, i), value) for i, value in enumerate(node))
+    return found
+
+
 # Packed buffer layout:
 #     [item_count: uint32 LE]
 #     [N × (payload_offset: uint32 LE, payload_size: uint32 LE)]

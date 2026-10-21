@@ -35,6 +35,8 @@ from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
+    ZMQMessageDecodeError,
+    ZMQMessageIntegrityError,
     ZMQRequestType,
     ZMQServerInfo,
     create_zmq_socket,
@@ -411,7 +413,22 @@ class SimpleStorageUnit:
                 identity = messages[0]
                 serialized_msg = messages[1:]
 
-                request_msg = ZMQMessage.deserialize(serialized_msg)
+                try:
+                    request_msg = ZMQMessage.deserialize(serialized_msg)
+                except ZMQMessageDecodeError as e:
+                    # Reply instead of letting the worker thread die, so the sender can
+                    # retry a request that was corrupted on the way here.
+                    logger.error(f"[{self.storage_unit_id}]: undecodable request: {type(e).__name__}: {e}")
+                    response_msg = ZMQMessage.create(
+                        request_type=ZMQRequestType.PUT_GET_ERROR,  # type: ignore[arg-type]
+                        sender_id=self.storage_unit_id,
+                        body={
+                            "message": f"{self.storage_unit_id} could not decode request: {e}",
+                            "integrity_error": isinstance(e, ZMQMessageIntegrityError),
+                        },
+                    )
+                    worker_socket.send_multipart([identity] + response_msg.serialize(), copy=False)
+                    continue
                 operation = request_msg.request_type
 
                 try:
