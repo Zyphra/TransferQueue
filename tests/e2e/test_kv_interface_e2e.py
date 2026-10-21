@@ -22,6 +22,7 @@ This test module validates the KV interface functionality by:
 
 import asyncio
 import os
+import time
 
 import pytest
 import ray
@@ -1075,6 +1076,122 @@ class TestKVClearE2E:
 
         # Clean up
         tq_api.kv_clear(keys=keys, partition_id=partition_id)
+
+
+@pytest.mark.parametrize("batched", [False, True], ids=["single", "batch"])
+@pytest.mark.parametrize("explicit_tags", [False, True], ids=["fields_only", "fields_and_tags"])
+def test_field_write_only_publishes_explicit_tags(
+    controller, tq_api, monkeypatch, record_property, batched, explicit_tags
+):
+    keys = ["tag_race_0", "tag_race_1"] if batched else ["tag_race_0"]
+    partition_id = "tag_race"
+    initial = [{"version": 1} for _ in keys]
+    tq_api.kv_batch_put(
+        keys=keys,
+        partition_id=partition_id,
+        fields=TensorDict({"initial": torch.ones(len(keys), 1)}, batch_size=len(keys)),
+        tags=initial,
+    )
+    client = tq.get_client()
+    original_put = client.storage_manager.put_data
+    original_set = client.async_set_custom_meta
+    publications = []
+    publication_seconds = []
+
+    async def record_set(metadata):
+        publications.append([dict(tag) for tag in metadata.custom_meta])
+        started = time.perf_counter()
+        try:
+            return await original_set(metadata)
+        finally:
+            publication_seconds.append(time.perf_counter() - started)
+
+    async def put_then_update_tags(data, metadata, data_parser=None):
+        await original_put(data, metadata, data_parser=data_parser)
+        # Interleave an actual supported tag write after payload readiness, while
+        # the enclosing field write still owns its older metadata snapshot.
+        await tq.async_kv_batch_put(keys=keys, partition_id=partition_id, tags=[{"version": 2} for _ in keys])
+
+    monkeypatch.setattr(client, "async_set_custom_meta", record_set)
+    monkeypatch.setattr(client.storage_manager, "put_data", put_then_update_tags)
+    tags = [{"version": 3} for _ in keys] if explicit_tags else None
+    values = torch.arange(len(keys), dtype=torch.float32).unsqueeze(1)
+    if batched:
+        result = tq_api.kv_batch_put(
+            keys=keys,
+            partition_id=partition_id,
+            fields=TensorDict({"new": values}, batch_size=len(keys)),
+            tags=tags,
+        )
+    else:
+        result = tq_api.kv_put(
+            key=keys[0], partition_id=partition_id, fields={"new": values[0]}, tag=tags[0] if tags else None
+        )
+
+    expected_version = 3 if explicit_tags else 2
+    listed = tq_api.kv_list(partition_id=partition_id)[partition_id]
+    assert [listed[key]["version"] for key in keys] == [expected_version] * len(keys)
+    assert publications == [[{"version": 2} for _ in keys]] + ([tags] if explicit_tags else [])
+    record_property("controller_set_count", len(publications))
+    record_property("field_write_controller_set_count", len(publications) - 1)
+    record_property("controller_set_seconds", sum(publication_seconds))
+    assert result.tags == (tags if explicit_tags else initial)
+    assert "new" in result.fields
+    actual = tq_api.kv_batch_get(keys=keys, partition_id=partition_id, select_fields=["new"])
+    assert_tensor_equal(actual["new"], values)
+
+
+def test_low_level_put_still_publishes_direct_metadata_edits(controller, tq_api, monkeypatch, record_property):
+    keys, partition_id = ["direct_tags"], "direct_tags"
+    tq_api.kv_batch_put(keys=keys, partition_id=partition_id, tags=[{"version": 1}])
+    client = tq.get_client()
+    metadata = client.kv_retrieve_meta(keys=keys, partition_id=partition_id, create=False)
+    metadata.custom_meta[0]["version"] = 2
+    fields = TensorDict({"value": torch.tensor([[7]])}, batch_size=1)
+    original_set = client.async_set_custom_meta
+    publication_seconds = []
+
+    async def record_set(metadata):
+        started = time.perf_counter()
+        try:
+            return await original_set(metadata)
+        finally:
+            publication_seconds.append(time.perf_counter() - started)
+
+    monkeypatch.setattr(client, "async_set_custom_meta", record_set)
+    if tq_api.use_async:
+        asyncio.run(client.async_put(fields, metadata))
+    else:
+        client.put(fields, metadata)
+    assert len(publication_seconds) == 1
+    record_property("controller_set_count", len(publication_seconds))
+    record_property("controller_set_seconds", sum(publication_seconds))
+    assert tq_api.kv_list(partition_id=partition_id)[partition_id][keys[0]]["version"] == 2
+    assert_tensor_equal(tq_api.kv_batch_get(keys=keys, partition_id=partition_id)["value"], fields["value"])
+
+
+def test_failed_field_write_does_not_publish_tags(controller, tq_api, monkeypatch):
+    keys, partition_id = ["failed_fields"], "failed_fields"
+    tq_api.kv_batch_put(keys=keys, partition_id=partition_id, tags=[{"version": 1}])
+    client = tq.get_client()
+
+    async def failed_put(*args, **kwargs):
+        raise OSError("storage write failed")
+
+    async def unexpected_set(*args, **kwargs):
+        raise AssertionError("failed payload must not publish tags")
+
+    monkeypatch.setattr(client.storage_manager, "put_data", failed_put)
+    monkeypatch.setattr(client, "async_set_custom_meta", unexpected_set)
+    with pytest.raises(OSError, match="storage write failed"):
+        tq_api.kv_batch_put(
+            keys=keys,
+            partition_id=partition_id,
+            fields=TensorDict({"failed": torch.ones(1, 1)}, batch_size=1),
+            tags=[{"version": 2}],
+        )
+    assert tq_api.kv_list(partition_id=partition_id)[partition_id][keys[0]]["version"] == 1
+    assert "failed" not in client.kv_retrieve_meta(keys=keys, partition_id=partition_id, create=False).field_names
 
 
 class TestKVE2ECornerCases:
