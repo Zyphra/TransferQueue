@@ -413,6 +413,17 @@ class AsyncTransferQueueClient:
             >>> metadata = asyncio.run(client.async_put(data=prompts_repeated_batch, partition_id=current_partition_id))
         """
 
+        return await self._async_put(data, metadata, partition_id, data_parser, publish_custom_meta=True)
+
+    async def _async_put(
+        self,
+        data: TensorDict,
+        metadata: BatchMeta | None = None,
+        partition_id: str | None = None,
+        data_parser: Callable[[Any], Any] | None = None,
+        *,
+        publish_custom_meta: bool,
+    ) -> BatchMeta:
         if not hasattr(self, "storage_manager") or self.storage_manager is None:
             raise RuntimeError(
                 f"[{self.client_id}]: Storage manager not initialized. "
@@ -445,7 +456,8 @@ class AsyncTransferQueueClient:
         ):
             await self.storage_manager.put_data(data, metadata, data_parser=data_parser)
 
-        await self.async_set_custom_meta(metadata)
+        if publish_custom_meta:
+            await self.async_set_custom_meta(metadata)
 
         logger.debug(
             f"[{self.client_id}]: partition {partition_id} put {metadata.size} samples to storage units successfully."

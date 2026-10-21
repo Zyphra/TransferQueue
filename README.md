@@ -127,6 +127,10 @@ To simplify the usage of TransferQueue, we provide a Redis-style high-level API 
 - **Fine-grained Access**: Update or retrieve specific fields (columns) within a key (row) without requiring a full-row operation.
 - **Partition Isolation**: Logical separation of storage namespaces.
 - **Metadata Tags**: Lightweight metadata for status tracking.
+
+KV field writes leave controller tags unchanged when `tag`/`tags` is omitted.
+Explicit tags, including tags-only writes, still update metadata. The lower-level
+client `put`/`async_put` continues to publish the supplied `BatchMeta.custom_meta`.
 - **Pluggable Backends**: Supports multiple backends.
 
 Refer to [tutorials/basic.ipynb](https://github.com/Ascend/TransferQueue/blob/main/tutorial/basic.ipynb) and [tutorials/02_kv_interface.py](https://github.com/Ascend/TransferQueue/blob/main/tutorial/02_kv_interface.py) for detailed usage examples.
