@@ -98,6 +98,8 @@ This data structure design is motivated by the computational characteristics of 
 
 The wire decoder rejects empty tensor or NumPy payload frames whose declared shape has nonzero elements. Legitimate zero-element shapes and NumPy scalar pickle serialization remain supported; a missing payload must never become uninitialized sample data.
 
+Plain metadata and tensor/NumPy columns decode without a second Python walk over every container. Legacy TensorDict markers retain recursive reconstruction, including marked mappings restored by pickle or cloudpickle extensions; the encoded wire format is unchanged.
+
 ### User Interface: High-Level & Low-Level APIs
 
 | Level | Tier | Style | Fine-Grained Access | Streaming | Sampler | Multiple-Backends | 

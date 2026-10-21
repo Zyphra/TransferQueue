@@ -19,6 +19,7 @@
 
 import math
 import pickle
+import re
 import struct
 import warnings
 from collections.abc import Callable, Sequence
@@ -45,6 +46,7 @@ CUSTOM_TYPE_NUMPY = 5  # For numpy ndarray with buffer reference
 # 0xC1 is permanently reserved (invalid) in msgpack spec — safe to use as pickle fallback sentinel.
 _PICKLE_FALLBACK_SENTINEL = b"\xc1\xfe\xed"
 _PICKLE_FALLBACK_SENTINEL_SIZE = len(_PICKLE_FALLBACK_SENTINEL)
+_TENSORDICT_MARKER = re.compile(b"__tq_tensordict__")
 
 bytestr: TypeAlias = bytes | bytearray | memoryview | zmq.Frame
 
@@ -58,6 +60,7 @@ warnings.filterwarnings(action="ignore", message=r"The given buffer is not writa
 # This enables the global _encoder/_decoder instances to be safely used across threads
 _encoder_aux_buffers: ContextVar[list[bytestr] | None] = ContextVar("encoder_aux_buffers", default=None)
 _decoder_aux_buffers: ContextVar[Sequence[bytestr] | None] = ContextVar("decoder_aux_buffers", default=None)
+_decoder_requires_reconstruction: ContextVar[bool] = ContextVar("decoder_requires_reconstruction", default=False)
 
 
 class MsgpackEncoder:
@@ -257,17 +260,27 @@ class MsgpackDecoder:
 
     def decode(self, bufs: bytestr | Sequence[bytestr]) -> Any:
         """Decode a list of bytes."""
-        if isinstance(bufs, bytestr):
-            result = self.decoder.decode(bufs)
-        else:
-            token = _decoder_aux_buffers.set(bufs)
-            try:
-                result = self.decoder.decode(bufs[0])  # type: ignore[index]
-            finally:
-                _decoder_aux_buffers.reset(token)
+        reconstruction_token = _decoder_requires_reconstruction.set(False)
+        try:
+            if isinstance(bufs, bytestr):
+                header = bufs
+                result = self.decoder.decode(bufs)
+            else:
+                header = bufs[0]
+                token = _decoder_aux_buffers.set(bufs)
+                try:
+                    result = self.decoder.decode(bufs[0])  # type: ignore[index]
+                finally:
+                    _decoder_aux_buffers.reset(token)
+            requires_reconstruction = _decoder_requires_reconstruction.get()
+        finally:
+            _decoder_requires_reconstruction.reset(reconstruction_token)
 
-        # Post-process to reconstruct TensorDict from marked dicts
-        return self._reconstruct_special_types(result)
+        # Plain metadata and tensor columns need no Python container walk. A
+        # literal buffer search also accepts ZMQ frames without copying them.
+        if requires_reconstruction or _TENSORDICT_MARKER.search(header) is not None:
+            return self._reconstruct_special_types(result)
+        return result
 
     def _reconstruct_special_types(self, obj: Any) -> Any:
         """Recursively reconstruct special types (TensorDict) from their dict representation."""
@@ -351,8 +364,10 @@ class MsgpackDecoder:
         - numpy.ndarray: Convert to tensor for unified handling
         """
         if code == CUSTOM_TYPE_PICKLE:
+            _decoder_requires_reconstruction.set(True)
             return pickle.loads(data)
         if code == CUSTOM_TYPE_CLOUDPICKLE:
+            _decoder_requires_reconstruction.set(True)
             return cloudpickle.loads(data)
         if code == CUSTOM_TYPE_TENSOR:
             meta = pickle.loads(data)
