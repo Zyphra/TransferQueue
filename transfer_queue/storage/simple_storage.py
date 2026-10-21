@@ -270,6 +270,8 @@ class SimpleStorageUnit:
         zmq_server_info: ZMQ connection information for clients.
     """
 
+    _checkpoint_future: Future[None]
+
     def __init__(self, storage_unit_size: int | None = None):
         """Initialize a SimpleStorageUnit with the specified size.
 
@@ -696,9 +698,9 @@ class SimpleStorageUnit:
             if phase == "status":
                 if path != getattr(self, "_checkpoint_path", None):
                     raise ValueError("checkpoint completion path does not match the pending snapshot")
-                future = self._checkpoint_future
-                done = future.done()
-                error = future.exception() if done else None
+                pending_future = self._checkpoint_future
+                done = pending_future.done()
+                error = pending_future.exception() if done else None
                 failure = failure_details(error)
                 return ZMQMessage.create(
                     request_type=ZMQRequestType.SAVE_STORAGE_CHECKPOINT_RESPONSE,
