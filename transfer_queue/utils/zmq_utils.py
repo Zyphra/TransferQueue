@@ -44,10 +44,12 @@ def _coalesce_frames(frames: list) -> list:
     """Group small row payloads using the existing packed-buffer codec."""
     if len(frames) <= 16:
         return frames
-    output, flags, pending = [], [], []
+    output: list[bytestr] = []
+    flags: list[int] = []
+    pending: list[bytestr] = []
     pending_bytes = 4
 
-    def flush():
+    def flush() -> None:
         nonlocal pending, pending_bytes
         if len(pending) > 1:
             buffer = np.empty(calc_packed_size(pending), dtype=np.uint8)
@@ -258,7 +260,7 @@ class ZMQMessage:
         )
 
     def serialize(self) -> list:
-        """Serialize using zero-copy msgpack; falls back to pickle for unsupported types."""
+        """Encode msgpack or pickle, then coalesce fragmented tensor payloads."""
         msg_dict = {
             "request_type": self.request_type.value,  # Enum -> str for msgpack
             "sender_id": self.sender_id,
