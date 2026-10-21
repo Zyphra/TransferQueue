@@ -107,10 +107,15 @@ def test_marker_key_created_by_pickle_is_not_missed():
 
     frames = MsgpackEncoder().encode(
         {
-            msgpack.Ext(CUSTOM_TYPE_PICKLE, pickle.dumps(_RestoredMarkerKey())): True,
+            "marker_key": True,
             "batch_size": [2],
             "data": {"values": torch.tensor([1.0, -0.0])},
         }
+    )
+    frames[0] = frames[0].replace(
+        msgpack.encode("marker_key"),
+        msgpack.encode(msgpack.Ext(CUSTOM_TYPE_PICKLE, pickle.dumps(_RestoredMarkerKey()))),
+        1,
     )
     assert b"__tq_tensordict__" not in frames[0]
     result = MsgpackDecoder().decode(frames)
