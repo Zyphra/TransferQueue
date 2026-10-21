@@ -21,6 +21,7 @@ from functools import wraps
 from typing import Any, Callable, TypeAlias
 from uuid import uuid4
 
+import numpy as np
 import psutil
 import ray
 import zmq
@@ -28,12 +29,66 @@ import zmq.asyncio
 
 from transfer_queue.utils.enum_utils import ExplicitEnum, Role
 from transfer_queue.utils.logging_utils import get_logger
-from transfer_queue.utils.serial_utils import decode, encode
+from transfer_queue.utils.serial_utils import calc_packed_size, decode, encode, pack_into, unpack_from
 
 logger = get_logger(__name__)
 
 
 bytestr: TypeAlias = bytes | bytearray | memoryview
+
+_COALESCED_FRAMES = b"\xc1TQPACK1"
+_PACKED_FRAME_BYTES = 64 * 1024 * 1024
+
+
+def _coalesce_frames(frames: list) -> list:
+    """Group small row payloads using the existing packed-buffer codec."""
+    if len(frames) <= 16:
+        return frames
+    output, flags, pending = [], [], []
+    pending_bytes = 4
+
+    def flush():
+        nonlocal pending, pending_bytes
+        if len(pending) > 1:
+            buffer = np.empty(calc_packed_size(pending), dtype=np.uint8)
+            pack_into(buffer, pending)
+            output.append(memoryview(buffer))
+            flags.append(1)
+        elif pending:
+            output.append(pending[0])
+            flags.append(0)
+        pending, pending_bytes = [], 4
+
+    for frame in frames:
+        size = memoryview(frame).nbytes
+        if pending_bytes + 8 + size > _PACKED_FRAME_BYTES:
+            flush()
+        if size > _PACKED_FRAME_BYTES:
+            output.append(frame)
+            flags.append(0)
+        else:
+            pending.append(frame)
+            pending_bytes += 8 + size
+    flush()
+    if len(output) == len(frames):
+        return frames
+    return [_COALESCED_FRAMES, bytes(flags), *output]
+
+
+def _expand_frames(frames: list) -> list:
+    marker = memoryview(frames[0])
+    if marker.nbytes != len(_COALESCED_FRAMES) or marker.tobytes() != _COALESCED_FRAMES:
+        return frames
+    if len(frames) < 3:
+        raise ValueError("coalesced message is missing its layout or payload")
+    flags = memoryview(frames[1]).cast("B")
+    if len(flags) != len(frames) - 2 or any(flag not in (0, 1) for flag in flags):
+        raise ValueError("invalid coalesced frame layout")
+    return [
+        part
+        for flag, frame in zip(flags, frames[2:], strict=True)
+        for part in (unpack_from(frame) if flag else [frame])
+    ]
 
 
 class ZMQRequestType(ExplicitEnum):
@@ -212,7 +267,10 @@ class ZMQMessage:
             "timestamp": self.timestamp,
             "body": self.body,
         }
-        return encode(msg_dict)
+        # Per-row frames make large jagged fields expensive to send and leave
+        # thousands of receive allocations behind after the global field copy.
+        # Coalescing retains the existing encoded bytes and decoded objects.
+        return _coalesce_frames(encode(msg_dict))
 
     @classmethod
     def deserialize(cls, frames: list) -> "ZMQMessage":
@@ -228,6 +286,7 @@ class ZMQMessage:
             raise ZMQMessageDecodeError(f"leading frame is empty; {describe_frames(frames)}")
 
         try:
+            frames = _expand_frames(frames)
             result = decode(frames)
         except Exception as e:
             raise ZMQMessageDecodeError(f"{type(e).__name__}: {e}; {describe_frames(frames)}") from e

@@ -98,6 +98,65 @@ def test_zmq_msg_serialization():
 
 
 @pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64, torch.int64, torch.bool]
+)
+def test_many_tensor_rows_cross_real_zmq_without_changing_bytes(dtype):
+    from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
+
+    rows = [torch.arange((index % 6) * 4).reshape(index % 6, 4).t()[::2].to(dtype) for index in range(48)]
+    if dtype.is_floating_point:
+        rows[0] = torch.tensor([0.0, -0.0, float("nan"), float("inf"), -float("inf")], dtype=dtype)
+    message = ZMQMessage.create(ZMQRequestType.PUT_DATA, "sender", {"data": rows})
+    frames = message.serialize()
+    assert len(frames) < len(rows)
+    context = zmq.Context()
+    sender = context.socket(zmq.PAIR)
+    receiver = context.socket(zmq.PAIR)
+    try:
+        sender.bind("inproc://row-frames")
+        receiver.connect("inproc://row-frames")
+        sender.send_multipart(frames, copy=False)
+        decoded = ZMQMessage.deserialize(receiver.recv_multipart(copy=False))
+    finally:
+        sender.close()
+        receiver.close()
+        context.term()
+    assert isinstance(decoded.body["data"], list)
+    for expected, actual in zip(rows, decoded.body["data"], strict=True):
+        assert actual.shape == expected.shape
+        assert actual.dtype == expected.dtype
+        assert torch.equal(
+            actual.contiguous().reshape(-1).view(torch.uint8), expected.contiguous().reshape(-1).view(torch.uint8)
+        )
+
+    # Persisted or earlier-release multipart payloads keep the existing decoder.
+    original = encode({**vars(message), "request_type": message.request_type.value})
+    old_decoded = ZMQMessage.deserialize(original)
+    assert len(old_decoded.body["data"]) == len(rows)
+
+
+def test_coalesced_message_rejects_missing_and_invalid_layout():
+    from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQMessageDecodeError, ZMQRequestType
+
+    message = ZMQMessage.create(ZMQRequestType.PUT_DATA, "sender", {"data": [torch.ones(3) for _ in range(32)]})
+    frames = message.serialize()
+    for malformed in (frames[:2], [frames[0], b"\x02", *frames[2:]]):
+        with pytest.raises(ZMQMessageDecodeError, match="coalesced"):
+            ZMQMessage.deserialize(malformed)
+
+
+def test_coalesced_message_keeps_a_large_individual_frame_and_empty_rows():
+    from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
+
+    large = torch.full((64 * 1024 * 1024 + 1,), 173, dtype=torch.uint8)
+    rows = [torch.empty(0, dtype=torch.int64) if index % 2 else torch.arange(index) for index in range(48)]
+    message = ZMQMessage.create(ZMQRequestType.GET_DATA_RESPONSE, "sender", {"large": large, "rows": rows})
+    decoded = ZMQMessage.deserialize(message.serialize())
+    assert torch.equal(decoded.body["large"], large)
+    assert all(torch.equal(actual, expected) for actual, expected in zip(decoded.body["rows"], rows, strict=True))
+
+
+@pytest.mark.parametrize(
     "make_view",
     [
         lambda x: x[:, :5],

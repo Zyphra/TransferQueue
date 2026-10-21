@@ -98,6 +98,8 @@ This data structure design is motivated by the computational characteristics of 
 
 The wire decoder rejects empty tensor or NumPy payload frames whose declared shape has nonzero elements. Legitimate zero-element shapes and NumPy scalar pickle serialization remain supported; a missing payload must never become uninitialized sample data.
 
+Large multipart messages coalesce small row frames into packed buffers of at most 64 MiB, using the same tensor serialization and decoded row objects. Large individual frames remain copy-free. Clients and services must use the same release when adopting this transport framing; the decoder continues to accept earlier multipart messages.
+
 ### User Interface: High-Level & Low-Level APIs
 
 | Level | Tier | Style | Fine-Grained Access | Streaming | Sampler | Multiple-Backends | 
