@@ -9,6 +9,7 @@ on:
       - main
       - dev
       - v0.*
+      - release/v0.*
 
 # Declare permissions just read content.
 permissions:
