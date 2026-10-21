@@ -22,7 +22,7 @@ from collections import defaultdict
 from collections.abc import Awaitable, Mapping, Sequence
 from operator import itemgetter
 from pathlib import Path
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable, NamedTuple, cast
 
 import torch
 import zmq
@@ -713,13 +713,14 @@ class AsyncSimpleStorageManager(StorageManager):
         ]
         # Observe every response before reporting settlement; a sibling may
         # still own a writer when another storage unit reports failure.
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for result in results:
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in gathered:
             if isinstance(result, BaseException):
                 raise result
+        results = cast(list[dict[str, Any]], gathered)
 
         if phase == "prepare":
-            prepared = {
+            prepared: dict[str, Any] = {
                 "prepared": all(item["prepared"] for item in results),
                 "retained_bytes": sum(item.get("retained_bytes") or 0 for item in results),
             }

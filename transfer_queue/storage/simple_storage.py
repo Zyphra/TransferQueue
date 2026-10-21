@@ -212,7 +212,8 @@ class StorageUnitData:
             for name, rows in self.field_data.items()
         }
         active = self._active_keys & indexes
-        pending, seen, stores, size = [fields, active], set(), set(), 0
+        stores: set[tuple[int, int] | int] = set()
+        pending, seen, size = [fields, active], set(), 0
         while pending:
             value = pending.pop()
             if id(value) in seen:
@@ -731,7 +732,7 @@ class SimpleStorageUnit:
                 and retained_bytes is not None
                 and retained_bytes <= data_parts.body["max_snapshot_bytes"]
             )
-            future = Future()
+            future: Future[None] = Future()
             self._checkpoint_future, self._checkpoint_path = future, path
             if prepared:
 

@@ -2202,7 +2202,7 @@ class TransferQueueController:
             Exception: If serialization or file I/O fails.
         """
         try:
-            state = {
+            state: dict[str, Any] = {
                 "controller_id": self.controller_id,
                 "partitions": {pid: p.to_snapshot() for pid, p in self.partitions.items()},
                 "index_manager": {
@@ -2224,6 +2224,7 @@ class TransferQueueController:
                 return sorted(set().union(*state["index_manager"]["partition_to_indexes"].values()))
         except Exception as e:
             raise RuntimeError(f"[{self.controller_id}]: save checkpoint failed: {e}") from e
+        return None
 
     def load_checkpoint(self, path: str) -> None:
         """Restore controller state directly from a file.

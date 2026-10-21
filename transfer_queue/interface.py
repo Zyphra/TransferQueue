@@ -24,7 +24,7 @@ from concurrent.futures import Future
 from importlib import resources
 from pathlib import Path
 from threading import Lock, Thread
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import ray
 import torch
@@ -1015,8 +1015,11 @@ def checkpoint_status(checkpoint_dir: str | Path, future: Future) -> dict:
             return {"settled": True}
         if not isinstance(error, CheckpointStorageError):
             raise error
-        result = _maybe_create_tq_client().save_storage_checkpoint(
-            str(path.parent / f"{path.name}.tmp"), phase="status", publish_manifest=False
+        result = cast(
+            dict,
+            _maybe_create_tq_client().save_storage_checkpoint(
+                str(path.parent / f"{path.name}.tmp"), phase="status", publish_manifest=False
+            ),
         )
         if any(not item["storage_io"] for item in result["failures"]):
             raise RuntimeError(f"Non-storage checkpoint failure: {result['failures']}") from error
@@ -1121,7 +1124,7 @@ def save_checkpoint(
         try:
             controller_path = str(tmp_dir / _CONTROLLER_FILE)
             if detached:
-                frontier = client.save_controller_checkpoint(controller_path, frontier=True)
+                frontier = cast(dict, client.save_controller_checkpoint(controller_path, frontier=True))
             else:
                 client.save_controller_checkpoint(controller_path)
             prepared = None
@@ -1186,7 +1189,7 @@ def save_checkpoint(
                 _commit_checkpoint(tmp_dir, checkpoint_dir, old_dir, meta_content)
 
             if prepared is not None and prepared["prepared"]:
-                future = Future()
+                future: Future[None] = Future()
                 future.set_running_or_notify_cancel()
                 _PENDING_CHECKPOINT = future
 
@@ -1209,7 +1212,7 @@ def save_checkpoint(
             if writers_started:
                 # A filesystem thread cannot be cancelled safely. Keep staging and
                 # reject a second save rather than deleting files still being written.
-                failed = Future()
+                failed: Future[None] = Future()
                 failed.set_exception(error)
                 _PENDING_CHECKPOINT = failed
                 if isinstance(error, CheckpointStorageError):
