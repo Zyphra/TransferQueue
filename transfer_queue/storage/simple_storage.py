@@ -103,7 +103,7 @@ class _CheckpointPickler(pickle.Pickler):
             or not value.is_contiguous()
             or value.is_neg()
             or value.__dict__
-            or any(name is not None for name in value.names)
+            or any(name is not None for name in getattr(value, "names", ()))
         ):
             return NotImplemented
         array = value.numpy()
@@ -212,7 +212,8 @@ class StorageUnitData:
             for name, rows in self.field_data.items()
         }
         active = self._active_keys & indexes
-        pending, seen, stores, size = [fields, active], set(), set(), 0
+        stores: set[tuple[int, int] | int] = set()
+        pending, seen, size = [fields, active], set(), 0
         while pending:
             value = pending.pop()
             if id(value) in seen:
@@ -268,6 +269,8 @@ class SimpleStorageUnit:
         storage_data: Internal StorageUnitData instance for data management.
         zmq_server_info: ZMQ connection information for clients.
     """
+
+    _checkpoint_future: Future[None]
 
     def __init__(self, storage_unit_size: int | None = None):
         """Initialize a SimpleStorageUnit with the specified size.
@@ -695,9 +698,9 @@ class SimpleStorageUnit:
             if phase == "status":
                 if path != getattr(self, "_checkpoint_path", None):
                     raise ValueError("checkpoint completion path does not match the pending snapshot")
-                future = self._checkpoint_future
-                done = future.done()
-                error = future.exception() if done else None
+                pending_future = self._checkpoint_future
+                done = pending_future.done()
+                error = pending_future.exception() if done else None
                 failure = failure_details(error)
                 return ZMQMessage.create(
                     request_type=ZMQRequestType.SAVE_STORAGE_CHECKPOINT_RESPONSE,
@@ -731,7 +734,7 @@ class SimpleStorageUnit:
                 and retained_bytes is not None
                 and retained_bytes <= data_parts.body["max_snapshot_bytes"]
             )
-            future = Future()
+            future: Future[None] = Future()
             self._checkpoint_future, self._checkpoint_path = future, path
             if prepared:
 

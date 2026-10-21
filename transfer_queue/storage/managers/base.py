@@ -361,7 +361,7 @@ class StorageManager(ABC):
         """
         raise NotImplementedError("Subclasses must implement clear_data")
 
-    async def save_checkpoint(self, checkpoint_dir: str) -> None:
+    async def save_checkpoint(self, checkpoint_dir: str) -> dict | None:
         """Save storage state into checkpoint_dir.
 
         The implementation is backend-specific: each backend decides what to
