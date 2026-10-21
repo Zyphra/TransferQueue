@@ -409,7 +409,8 @@ class TestCheckpointErrors:
         with pytest.raises(ValueError, match="count mismatch"):
             tq.load_checkpoint(checkpoint_dir)
 
-    def test_no_partial_state_on_failed_save(self, tq_system, tmp_path):
+    @pytest.mark.parametrize("failed_phase", ["controller", "storage"])
+    def test_failed_save_never_publishes_partial_state(self, tq_system, tmp_path, failed_phase):
         # Define test data + Put
         tq.kv_batch_put(
             keys=["f0"],
@@ -423,12 +424,20 @@ class TestCheckpointErrors:
         import unittest.mock as mock
 
         with mock.patch(
-            "transfer_queue.client.TransferQueueClient.save_storage_checkpoint",
+            f"transfer_queue.client.TransferQueueClient.save_{failed_phase}_checkpoint",
             side_effect=RuntimeError("simulated dump failure"),
         ):
             with pytest.raises(RuntimeError, match="simulated dump failure"):
                 tq.save_checkpoint(ck)
 
-        # Check saved state: no partial directory left
+        # A storage fanout can start writers before raising. Keep their staging
+        # until settlement; failure before that fanout owns no writer.
         assert not ck.exists()
-        assert not (tmp_path / "ck.tmp").exists()
+        assert (tmp_path / "ck.tmp").exists() == (failed_phase == "storage")
+        if failed_phase == "storage":
+            from transfer_queue import interface
+
+            pending = interface._PENDING_CHECKPOINT
+            assert pending is not None and pending.done()
+            with pytest.raises(RuntimeError, match="simulated dump failure"):
+                pending.result()

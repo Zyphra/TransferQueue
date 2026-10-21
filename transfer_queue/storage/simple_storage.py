@@ -103,7 +103,7 @@ class _CheckpointPickler(pickle.Pickler):
             or not value.is_contiguous()
             or value.is_neg()
             or value.__dict__
-            or any(name is not None for name in value.names)
+            or any(name is not None for name in getattr(value, "names", ()))
         ):
             return NotImplemented
         array = value.numpy()
