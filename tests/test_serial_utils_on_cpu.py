@@ -76,9 +76,7 @@ def test_plain_metadata_and_tensor_columns_keep_wire_types(wrap, unknown):
 def test_pickle_extension_reconstructs_markers_not_present_in_wire_header(extension, dumps):
     from msgspec import msgpack
 
-    frames = MsgpackEncoder().encode(
-        {"unknown": msgpack.Ext(extension, dumps(_RestoredMarkedMapping()))}
-    )
+    frames = MsgpackEncoder().encode({"unknown": msgpack.Ext(extension, dumps(_RestoredMarkedMapping()))})
     assert b"__tq_tensordict__" not in frames[0]
     result = MsgpackDecoder().decode(frames)
     assert isinstance(result["unknown"], TensorDict)
@@ -103,19 +101,12 @@ class _RestoredMarkerKey:
 
 
 def test_marker_key_created_by_pickle_is_not_missed():
-    from msgspec import msgpack
-
     frames = MsgpackEncoder().encode(
         {
-            "marker_key": True,
+            _RestoredMarkerKey(): True,
             "batch_size": [2],
             "data": {"values": torch.tensor([1.0, -0.0])},
         }
-    )
-    frames[0] = frames[0].replace(
-        msgpack.encode("marker_key"),
-        msgpack.encode(msgpack.Ext(CUSTOM_TYPE_PICKLE, pickle.dumps(_RestoredMarkerKey()))),
-        1,
     )
     assert b"__tq_tensordict__" not in frames[0]
     result = MsgpackDecoder().decode(frames)
