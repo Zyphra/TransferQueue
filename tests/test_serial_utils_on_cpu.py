@@ -14,6 +14,9 @@
 # limitations under the License.
 
 
+import pickle
+
+import cloudpickle
 import numpy as np
 import pytest
 import torch
@@ -22,12 +25,119 @@ from tensordict import TensorDict
 
 from transfer_queue.utils.serial_utils import (
     _PICKLE_FALLBACK_SENTINEL,
+    CUSTOM_TYPE_CLOUDPICKLE,
+    CUSTOM_TYPE_PICKLE,
     MsgpackDecoder,
     MsgpackEncoder,
     _is_pickle_fallback,
     decode,
     encode,
 )
+
+
+def _restored_marked_mapping():
+    return {
+        "".join(("__tq_", "tensordict__")): True,
+        "batch_size": [2],
+        "data": {"values": torch.tensor([1.0, -0.0])},
+    }
+
+
+class _RestoredMarkedMapping:
+    def __reduce__(self):
+        return _restored_marked_mapping, ()
+
+
+@pytest.mark.parametrize("wrap", [bytes, bytearray, memoryview, zmq.Frame])
+@pytest.mark.parametrize("unknown", [None, np.float32(1.25)])
+def test_plain_metadata_and_tensor_columns_keep_wire_types(wrap, unknown):
+    metadata = {
+        "train": {
+            "sample": {
+                "episode_context_tokens": {"keys": ["sample"], "lengths": [0, 7, 12]},
+                "unknown": unknown,
+                "missing": None,
+                "flags": [True, False],
+            }
+        },
+        "tensor": torch.tensor([0.0, -0.0, float("inf")]),
+        "array": np.arange(12, dtype=np.int64).reshape(3, 4),
+    }
+    result = MsgpackDecoder().decode([wrap(frame) for frame in MsgpackEncoder().encode(metadata)])
+    assert result["train"] == metadata["train"]
+    assert type(result["train"]["sample"]["unknown"]) is type(unknown)
+    assert torch.equal(result["tensor"].view(torch.uint8), metadata["tensor"].view(torch.uint8))
+    np.testing.assert_array_equal(result["array"], metadata["array"])
+
+
+@pytest.mark.parametrize(
+    ("extension", "dumps"), [(CUSTOM_TYPE_PICKLE, pickle.dumps), (CUSTOM_TYPE_CLOUDPICKLE, cloudpickle.dumps)]
+)
+def test_pickle_extension_reconstructs_markers_not_present_in_wire_header(extension, dumps):
+    from msgspec import msgpack
+
+    frames = MsgpackEncoder().encode({"unknown": msgpack.Ext(extension, dumps(_RestoredMarkedMapping()))})
+    assert b"__tq_tensordict__" not in frames[0]
+    result = MsgpackDecoder().decode(frames)
+    assert isinstance(result["unknown"], TensorDict)
+    assert torch.equal(result["unknown"]["values"].view(torch.uint8), torch.tensor([1.0, -0.0]).view(torch.uint8))
+
+
+def test_unknown_extension_still_fails():
+    from msgspec import msgpack
+
+    frames = MsgpackEncoder().encode({"unknown": msgpack.Ext(127, b"metadata")})
+    with pytest.raises(NotImplementedError, match="Extension type code 127 is not supported"):
+        MsgpackDecoder().decode(frames)
+
+
+def _restored_marker_key():
+    return "".join(("__tq_", "tensordict__"))
+
+
+class _RestoredMarkerKey:
+    def __reduce__(self):
+        return _restored_marker_key, ()
+
+
+def test_marker_key_created_by_pickle_is_not_missed():
+    frames = MsgpackEncoder().encode(
+        {
+            _RestoredMarkerKey(): True,
+            "batch_size": [2],
+            "data": {"values": torch.tensor([1.0, -0.0])},
+        }
+    )
+    assert b"__tq_tensordict__" not in frames[0]
+    result = MsgpackDecoder().decode(frames)
+    assert isinstance(result, TensorDict)
+    assert torch.equal(result["values"], torch.tensor([1.0, -0.0]))
+
+
+@pytest.mark.parametrize("marker_text", ["plain metadata", "contains __tq_tensordict__ as text"])
+def test_unknown_pickle_values_and_legacy_marked_mappings_cross_socket(marker_text):
+    from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
+
+    message = ZMQMessage.create(
+        ZMQRequestType.KV_LIST_RESPONSE,
+        "controller",
+        {"partition_info": {"train": {"sample": {"text": marker_text, "unknown": _RestoredMarkedMapping()}}}},
+    )
+    context = zmq.Context()
+    sender, receiver = context.socket(zmq.PAIR), context.socket(zmq.PAIR)
+    try:
+        sender.bind("inproc://metadata-decode")
+        receiver.connect("inproc://metadata-decode")
+        sender.send_multipart(message.serialize(), copy=False)
+        result = ZMQMessage.deserialize(receiver.recv_multipart(copy=False))
+    finally:
+        sender.close()
+        receiver.close()
+        context.term()
+    tags = result.body["partition_info"]["train"]["sample"]
+    assert tags["text"] == marker_text
+    assert isinstance(tags["unknown"], TensorDict)
+    assert torch.equal(tags["unknown"]["values"], torch.tensor([1.0, -0.0]))
 
 
 @pytest.mark.parametrize(
