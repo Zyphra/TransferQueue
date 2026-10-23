@@ -416,3 +416,65 @@ cut. Retirement releases bookkeeping only: it never deletes files, commits a
 late writer, or chooses the caller's valid committed fallback. Failed/unknown
 ownership continues to reject another cut. Defaults and capture quiescence are
 unchanged; this is not a cancellation API or a process-memory bound.
+
+### Offline lean trajectory evidence
+
+`python -m transfer_queue.lean_archive` projects trusted, own-user native
+SimpleStorage checkpoints into non-restorable evidence. It never modifies the
+input, loads a model, or removes checkpoint state. It preserves exact CPU tensor
+bytes/dtypes for token IDs, masks and stored rewards, plus a bounded light-signal
+allowlist. Missing native rewards remain explicitly absent; empty responses stay
+empty. Routed experts, log-probabilities, full batches and grader payloads are
+omitted. Unsupported tensor layouts, non-JSON identity/signals and inconsistent
+lengths fail rather than being silently converted.
+
+First produce a controller plan, binding its original storage-unit manifest:
+
+```bash
+python -m transfer_queue.lean_archive plan \
+  --controller checkpoint/controller_state.pkl --controller-sha256 "$CONTROLLER_SHA" \
+  --max-controller-bytes "$CONTROLLER_BYTES" \
+  --unit-manifest checkpoint/simple_storage/storage_unit_info.json \
+  --unit-manifest-sha256 "$MANIFEST_SHA" \
+  --completed-tag status --completed-value success --output plan.json
+```
+
+Paths/layout must match the producing version; older versions can use different
+filenames. `success` here means published rows, not successful tasks or complete
+episodes. Optional `--episode-contract prompt-session-terminal-v1` audits an
+explicit producer contract: prompt `is_prompt`, terminal `finished`/`failure`,
+`expected_session_count`, per-session `failure_records`, and canonical
+`uid_session_output` rows. Complete published sessions require contiguous output
+ordinals and an `episode_metrics` terminal carrier. Failed sessions with no row
+remain light controller evidence, with no invented tokens or reward. Running
+prompts, missing rows/carriers, prompt-level aborts, conflicting failures and
+orphan trajectories keep completeness unknown. Qualify that contract against the
+actual producer before relying on it; metadata alone proves no payload coverage.
+
+Extract **one** native unit per allocated CPU process after reviewing memory fit:
+
+```bash
+python -m transfer_queue.lean_archive extract \
+  --plan plan.json --plan-sha256 "$PLAN_SHA" \
+  --unit checkpoint/simple_storage/su_0_UNIT.pkl --unit-position 0 \
+  --max-unit-bytes "$UNIT_BYTES" --unit-sha256 "$UNIT_SHA" --output new-archive
+```
+
+Native pickle loading materializes the **entire unit**, including fields omitted
+from the lean output. Serialized file size is not a bound on RSS or temporary
+Torch storage allocations. These files must already be trusted: pickle can
+execute code before a hash mismatch is reported. Input checks bind UID, regular
+file, inode, device, size and timestamps before/after the single read; they do not
+authenticate a foreign or malicious producer. The unit ID and modulo ownership
+must match the manifest-bound plan. The output is deterministic gzip JSONL and a
+manifest with input/output digests. A directory is finished only when
+`manifest.json` exists and `INCOMPLETE` is absent. Failed output stays visibly
+incomplete; retries use a new directory and never overwrite evidence.
+
+`audit-index --plan ... --plan-sha256 ... --index ... --index-sha256 ... --output ...`
+joins a separately authenticated JSONL export index by exact row key and controller
+digest. Index entries require a lowercase record SHA-256 and explicit
+`token_ids_present`, `masks_present`, `reward_present` assertions. This reports
+index attestations only: it does not read the export bodies or prove episode
+coverage. An empty or historically missing denominator never earns coverage.
+No command grants cleanup authorization or full-state reload equivalence.
