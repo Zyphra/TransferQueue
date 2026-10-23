@@ -916,6 +916,7 @@ class AsyncTransferQueueClient:
         *,
         data_fields: list[str] | None = None,
         include_custom_meta: bool = True,
+        include_field_schema: bool = True,
     ) -> BatchMeta:
         """Asynchronously retrieve BatchMeta by user-defined keys.
 
@@ -929,6 +930,7 @@ class AsyncTransferQueueClient:
             socket: ZMQ socket injected by @with_controller_socket.
             data_fields: Optional field projection performed by the controller.
             include_custom_meta: Include per-key user tags in the response.
+            include_field_schema: Include per-field shapes and backend locators.
 
         Returns:
             BatchMeta: Metadata for the requested keys.
@@ -955,6 +957,7 @@ class AsyncTransferQueueClient:
                     "create": create,
                     "data_fields": data_fields,
                     "include_custom_meta": include_custom_meta,
+                    "include_field_schema": include_field_schema,
                 },
             )
             return response_msg.body.get("metadata", BatchMeta.empty())

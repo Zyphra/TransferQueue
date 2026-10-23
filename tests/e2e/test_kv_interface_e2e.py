@@ -1260,7 +1260,7 @@ def test_projected_metadata_matches_legacy_selection(controller, tq_api, selecte
 
 
 @pytest.mark.parametrize("explicit_tags", [False, True])
-def test_no_metadata_write_preserves_values_tags_and_readiness(controller, tq_api, monkeypatch, explicit_tags):
+def test_write_projects_schemas_preserving_values_tags_and_readiness(controller, tq_api, monkeypatch, explicit_tags):
     keys = ["scalar_0", "scalar_1"]
     tags = [{"uid": key, "version": 1} for key in keys]
     tq_api.kv_batch_put(
@@ -1286,13 +1286,14 @@ def test_no_metadata_write_preserves_values_tags_and_readiness(controller, tq_ap
         partition_id="scalar_write",
         fields=TensorDict({"scalar": scalars}, batch_size=2),
         tags=[{"version": 2} for _ in keys] if explicit_tags else None,
-        return_metadata=False,
     )
-    assert result is None
+    assert result.fields == ["old", "scalar"]
+    assert result.tags == [dict(tag, version=2) if explicit_tags else tag for tag in tags]
     body, metadata = responses.pop()
-    assert body["data_fields"] == [] and body["include_custom_meta"] == explicit_tags
-    assert metadata.field_names == []
-    assert metadata.custom_meta == (tags if explicit_tags else [{}, {}])
+    assert body["data_fields"] is None and body["include_custom_meta"] is True
+    assert body["include_field_schema"] is False
+    assert metadata.field_schema == {"old": {}} and metadata._custom_backend_meta == [{}, {}]
+    assert metadata.custom_meta == tags
     actual = tq_api.kv_batch_get(keys=keys, partition_id="scalar_write")
     assert_tensor_equal(actual["scalar"].view(torch.uint8), scalars.view(torch.uint8))
     assert_tensor_equal(actual["old"], torch.ones(2, 8))
@@ -1300,9 +1301,10 @@ def test_no_metadata_write_preserves_values_tags_and_readiness(controller, tq_ap
     assert [listed[key] for key in keys] == [dict(tag, version=2) if explicit_tags else tag for tag in tags]
 
 
-def test_no_metadata_write_creates_keys_and_keeps_default_receipt(controller, tq_api):
+def test_projected_write_creates_keys_and_keeps_default_receipt(controller, tq_api):
     data = TensorDict({"scalar": torch.tensor([[1.0, 2.0]])}, batch_size=1)
-    assert tq_api.kv_batch_put(keys=["new"], partition_id="new", fields=data, return_metadata=False) is None
+    created = tq_api.kv_batch_put(keys=["new"], partition_id="new", fields=data)
+    assert created.keys == ["new"] and created.fields == ["scalar"] and created.tags == [{}]
     assert_tensor_equal(tq_api.kv_batch_get(keys="new", partition_id="new")["scalar"], data["scalar"])
     receipt = tq_api.kv_batch_put(keys=["new"], partition_id="new", tags=[{"version": 2}])
     assert receipt.keys == ["new"] and receipt.tags == [{"version": 2}] and receipt.fields == ["scalar"]

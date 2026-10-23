@@ -1380,6 +1380,7 @@ class TransferQueueController:
         data_fields: list[str],
         mode: str = "fetch",
         include_custom_meta: bool = True,
+        include_field_schema: bool = True,
     ) -> BatchMeta:
         """
         Generate BatchMeta for specific samples in a partition.
@@ -1410,7 +1411,11 @@ class TransferQueueController:
 
         batch_size = len(batch_global_indexes)
 
-        field_schema = partition.get_field_schema(data_fields, batch_global_indexes)
+        field_schema = (
+            partition.get_field_schema(data_fields, batch_global_indexes)
+            if include_field_schema
+            else {name: {} for name in data_fields}
+        )
 
         # In insert mode, create placeholder schema for unregistered fields so that
         # metadata.field_names is complete and update_production_status() can recognize them.
@@ -1451,7 +1456,9 @@ class TransferQueueController:
                         production_status[in_range] = ready
 
         custom_meta_dict = partition.get_custom_meta(batch_global_indexes) if include_custom_meta else {}
-        custom_backend_meta = partition.get_field_custom_backend_meta(batch_global_indexes, data_fields)
+        custom_backend_meta = (
+            partition.get_field_custom_backend_meta(batch_global_indexes, data_fields) if include_field_schema else {}
+        )
 
         # Convert controller dict[int, dict] → BatchMeta list[dict] (aligned with batch_global_indexes)
         custom_meta_list = [custom_meta_dict.get(global_index, {}) for global_index in batch_global_indexes]
@@ -1617,6 +1624,7 @@ class TransferQueueController:
         create: bool = False,
         data_fields: list[str] | None = None,
         include_custom_meta: bool = True,
+        include_field_schema: bool = True,
     ) -> BatchMeta:
         """
         Retrieve BatchMeta from the controller using a list of keys.
@@ -1628,6 +1636,8 @@ class TransferQueueController:
             create: Whether to register new keys if not found.
             data_fields: Optional field projection, applied before schema generation.
             include_custom_meta: Include per-key user tags in the response.
+            include_field_schema: Include per-field shapes and backend locators;
+                writes need only the existing field names.
 
         Returns:
             metadata: BatchMeta of the requested keys
@@ -1697,7 +1707,12 @@ class TransferQueueController:
         # projection selects no fields; client-side selection retained it too.
         mode = "fetch" if ready_fields else "force_fetch"
         return self.generate_batch_meta(
-            partition_id, verified_global_indexes, data_fields, mode=mode, include_custom_meta=include_custom_meta
+            partition_id,
+            verified_global_indexes,
+            data_fields,
+            mode=mode,
+            include_custom_meta=include_custom_meta,
+            include_field_schema=include_field_schema,
         )
 
     def kv_retrieve_keys(
@@ -2140,6 +2155,7 @@ class TransferQueueController:
             create=params["create"],
             data_fields=params.get("data_fields"),
             include_custom_meta=params.get("include_custom_meta", True),
+            include_field_schema=params.get("include_field_schema", True),
         )
         return self._make_response(
             request_msg,

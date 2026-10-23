@@ -126,11 +126,10 @@ from their internal metadata response; returned field values and key order are
 unchanged. The low-level metadata API still includes all ready fields and tags
 unless a projection is requested explicitly.
 
-For a write whose metadata receipt is unused, pass `return_metadata=False` to
-`(async_)kv_batch_put`. It returns `None` after storage and readiness publication
-settle, without retrieving existing field schemas or unchanged tags. Explicit
-tag updates retain their merge/publication behavior. The default still returns
-the full `KVBatchMeta` snapshot, including existing fields and tags.
+Batch writes fetch existing field names and tags without per-row tensor shapes
+or backend locators: storage writes derive their schema from the actual values.
+The returned `KVBatchMeta` still includes all existing fields and the same tag
+snapshot. Explicit tag updates retain their merge/publication behavior.
 
 **Key Features**
 
