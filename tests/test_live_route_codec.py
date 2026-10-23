@@ -141,3 +141,47 @@ def test_many_tensordict_projections_do_not_hide_unknown_ownership():
     assert retained is None
     fields = {"routed_experts": [torch.arange(16, dtype=torch.int16)], "metadata": metadata}
     assert type(pack_route_fields(fields)["routed_experts"][0]) is torch.Tensor
+
+
+def test_optional_route_stats_are_metadata_only_and_deduplicate_backing(monkeypatch):
+    actor = unit()
+    actor._metrics = None
+    backing = torch.arange(16, dtype=torch.int16)
+    packed = PackedRoutes(torch.tensor([0, 1, 2, 3], dtype=torch.uint8))
+    actor.storage_data.field_data = {
+        "routed_experts": {
+            0: packed,
+            1: backing[:10],
+            2: backing[5:],
+            3: SimpleNamespace(opaque=True),
+        }
+    }
+    actor.storage_data._active_keys = {0, 1, 2, 3}
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("route stats must not materialize or unpack payload")
+
+    monkeypatch.setattr(PackedRoutes, "restore", forbidden)
+    monkeypatch.setattr(torch.Tensor, "to", forbidden)
+    monkeypatch.setattr(torch.Tensor, "numpy", forbidden)
+    response = actor._handle_get_metrics(route_stats=True).body["route_storage"]
+    assert response == dict(
+        row_count=4,
+        packed_rows=1,
+        unpacked_rows=2,
+        unknown_rows=1,
+        logical_view_bytes_known=50,
+        stored_view_bytes_known=46,
+        unique_backing_bytes_known=36,
+        logical_dtype_counts={"torch.int16": 3},
+        stored_dtype_counts={"torch.uint8": 1, "torch.int16": 2},
+    )
+    assert actor.storage_data.field_data["routed_experts"][0] is packed
+    assert actor.storage_data.field_data["routed_experts"][1].untyped_storage().data_ptr() == backing.data_ptr()
+    monkeypatch.setattr(actor.storage_data, "route_storage_stats", forbidden)
+    assert "route_storage" not in actor._handle_get_metrics().body
+
+
+def test_route_stats_flag_refuses_nonboolean():
+    with pytest.raises(ValueError, match="boolean"):
+        unit()._handle_get_metrics(route_stats="true")

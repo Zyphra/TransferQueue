@@ -20,6 +20,7 @@ from transfer_queue.storage.simple_storage import (
     SimpleStorageUnit,
     StorageUnitData,
     _CheckpointPickler,
+    _read_storage_checkpoint,
 )
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
 
@@ -184,7 +185,7 @@ def test_async_capture_survives_clear_and_reuse(tmp_path, monkeypatch):
     finally:
         release.set()
     actor._checkpoint_future.result(timeout=10)
-    restored = pickle.loads(path.read_bytes())
+    restored = _read_storage_checkpoint(path)
     assert torch.equal(restored["field_data"]["routed_experts"][0], old)
     assert restored["active_keys"] == {0}
 
@@ -294,7 +295,7 @@ def test_public_transport_put_save_route_eligibility(tmp_path, layout):
     payload = path.read_bytes()
     assert b"_rebuild_device_tensor_from_numpy" in direct
     assert len(payload) < len(legacy) * 0.6
-    restored = pickle.loads(path.read_bytes())["field_data"]["routed_experts"]
+    restored = _read_storage_checkpoint(path)["field_data"]["routed_experts"]
     ordinary = pickle.loads(legacy)["field_data"]["routed_experts"]
     for index, expected in enumerate(rows):
         assert restored[index].dtype == expected.dtype and restored[index].shape == expected.shape

@@ -12,6 +12,7 @@ from omegaconf import OmegaConf
 from tensordict import NonTensorStack, TensorDict
 
 import transfer_queue as tq
+from transfer_queue.metrics import TQMetricsExporter
 
 
 @pytest.fixture
@@ -77,6 +78,21 @@ def test_public_kv_metadata_and_async_checkpoint_roundtrip(system, tmp_path):
     tq.kv_batch_put(keys=keys, partition_id=partition, fields=fields, tags=tags)
     meta = tq.get_client().kv_retrieve_meta(keys, partition, create=False)
     assert meta.field_schema["routed_experts"]["dtype"] == torch.int16
+    reader = TQMetricsExporter(role="diagnostic")
+    try:
+        reports = [
+            reader._query_storage_unit(info, name, route_stats=True)["route_storage"]
+            for name, info in tq.get_client().storage_manager.get_zmq_server_info().items()
+        ]
+    finally:
+        for socket in reader._zmq_sockets.values():
+            socket.close(linger=0)
+        if reader._zmq_ctx is not None:
+            reader._zmq_ctx.term()
+    assert sum(report["packed_rows"] for report in reports) == 2
+    assert sum(report["stored_dtype_counts"].get("torch.uint8", 0) for report in reports) == 2
+    assert sum(report["logical_view_bytes_known"] for report in reports) == routes.nbytes
+    assert sum(report["stored_view_bytes_known"] for report in reports) == routes.numel()
     before = tq.kv_batch_get(keys=keys, partition_id=partition)
     assert {name: tensor_hash(before[name]) for name in expected} == expected
     path = tmp_path / "checkpoint"

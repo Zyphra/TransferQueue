@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import os
 import pickle
 import sys
@@ -28,6 +29,7 @@ import psutil
 import ray
 import torch
 import zmq
+import zstandard
 from tensordict import TensorDictBase
 
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
@@ -52,6 +54,8 @@ logger = get_logger(__name__)
 
 TQ_STORAGE_POLLER_TIMEOUT = int(os.environ.get("TQ_STORAGE_POLLER_TIMEOUT", 5))  # in seconds
 TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
+_CHECKPOINT_MAGIC = b"TQZSTD1\0"
+_CHECKPOINT_HEADER_SIZE = len(_CHECKPOINT_MAGIC) + 8 + 32
 
 
 class _CheckpointPickler(pickle.Pickler):
@@ -81,6 +85,63 @@ class _CheckpointPickler(pickle.Pickler):
         return torch._utils._rebuild_device_tensor_from_numpy, (array.astype(np.uint8), torch.int16, "cpu", False)
 
 
+class _CheckpointHashStream:
+    """Hash compressed bytes during the existing write/read, without a second I/O pass."""
+
+    def __init__(self, stream):
+        self.stream, self.digest, self.size = stream, hashlib.sha256(), 0
+
+    def write(self, data):
+        count = self.stream.write(data)
+        self.digest.update(memoryview(data)[:count])
+        self.size += count
+        return count
+
+    def read(self, size=-1):
+        data = self.stream.read(size)
+        self.digest.update(data)
+        self.size += len(data)
+        return data
+
+    def flush(self):
+        self.stream.flush()
+
+
+def _write_storage_checkpoint(path, state):
+    with open(path, "wb") as raw:
+        raw.write(_CHECKPOINT_MAGIC + bytes(_CHECKPOINT_HEADER_SIZE - len(_CHECKPOINT_MAGIC)))
+        hashed = _CheckpointHashStream(raw)
+        compressor = zstandard.ZstdCompressor(level=1, threads=max(0, TQ_NUM_THREADS - 1), write_checksum=True)
+        with compressor.stream_writer(hashed, closefd=False) as stream:
+            _CheckpointPickler(stream, state).dump(state)
+        size = raw.tell()
+        raw.seek(len(_CHECKPOINT_MAGIC))
+        raw.write(size.to_bytes(8, "little") + hashed.digest.digest())
+        raw.flush()
+        os.fsync(raw.fileno())
+
+
+def _read_storage_checkpoint(path):
+    with open(path, "rb") as raw:
+        if raw.read(len(_CHECKPOINT_MAGIC)) != _CHECKPOINT_MAGIC:
+            raw.seek(0)
+            return pickle.load(raw)
+        size, expected_digest = int.from_bytes(raw.read(8), "little"), raw.read(32)
+        if size != os.fstat(raw.fileno()).st_size:
+            raise ValueError("Compressed checkpoint size mismatch")
+        if not zstandard.get_frame_parameters(raw.read(18)).has_checksum:
+            raise ValueError("Compressed checkpoint lacks a checksum")
+        raw.seek(_CHECKPOINT_HEADER_SIZE)
+        hashed = _CheckpointHashStream(raw)
+        with zstandard.ZstdDecompressor().stream_reader(hashed, closefd=False, read_across_frames=True) as stream:
+            state = pickle.load(stream)
+            if stream.read(1):
+                raise ValueError("Compressed checkpoint has trailing payload")
+        if hashed.size != size - _CHECKPOINT_HEADER_SIZE or hashed.digest.digest() != expected_digest:
+            raise ValueError("Compressed checkpoint digest mismatch")
+        return state
+
+
 class StorageUnitData:
     """Storage unit for managing 2D data structure (samples × fields).
 
@@ -106,6 +167,45 @@ class StorageUnitData:
     def active_key_count(self) -> int:
         """Number of active keys currently stored."""
         return len(self._active_keys)
+
+    def route_storage_stats(self) -> dict:
+        stats: dict[str, Any] = dict(
+            row_count=0,
+            packed_rows=0,
+            unpacked_rows=0,
+            unknown_rows=0,
+            logical_view_bytes_known=0,
+            stored_view_bytes_known=0,
+            unique_backing_bytes_known=0,
+        )
+        stats["logical_dtype_counts"], stats["stored_dtype_counts"] = {}, {}
+        stores = set()
+        for value in self.field_data.get("routed_experts", {}).values():
+            stats["row_count"] += 1
+            packed = isinstance(value, PackedRoutes)
+            tensor = value.data if packed else value
+            if (
+                type(tensor) is not torch.Tensor
+                or tensor.device.type != "cpu"
+                or tensor.layout != torch.strided
+                or tensor.is_nested
+            ):
+                stats["unknown_rows"] += 1
+                continue
+            storage = tensor.untyped_storage()
+            identity = (storage.data_ptr(), storage.nbytes())
+            if identity not in stores:
+                stores.add(identity)
+                stats["unique_backing_bytes_known"] += storage.nbytes()
+            stats["packed_rows" if packed else "unpacked_rows"] += 1
+            for key, dtype in (
+                ("logical_dtype_counts", "torch.int16" if packed else str(tensor.dtype)),
+                ("stored_dtype_counts", str(tensor.dtype)),
+            ):
+                stats[key][dtype] = stats[key].get(dtype, 0) + 1
+            stats["stored_view_bytes_known"] += tensor.nbytes
+            stats["logical_view_bytes_known"] += tensor.numel() * (2 if packed else tensor.element_size())
+        return stats
 
     def get_data(self, fields: list[str], global_indexes: list, *, packed_routes: bool = False) -> dict[str, list]:
         """Get data by global index keys.
@@ -405,7 +505,7 @@ class SimpleStorageUnit:
                         with monitor.measure(op_type="CLEAR_DATA"):
                             response_msg = self._handle_clear(request_msg)
                     elif operation == ZMQRequestType.GET_METRICS:  # type: ignore[arg-type]
-                        response_msg = self._handle_get_metrics()
+                        response_msg = self._handle_get_metrics(route_stats=request_msg.body.get("route_stats", False))
                     elif operation == ZMQRequestType.SAVE_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
                         response_msg = self._handle_save_checkpoint(request_msg)
                     elif operation == ZMQRequestType.LOAD_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
@@ -595,13 +695,15 @@ class SimpleStorageUnit:
             )
         return response_msg
 
-    def _handle_get_metrics(self) -> ZMQMessage:
+    def _handle_get_metrics(self, *, route_stats: bool = False) -> ZMQMessage:
         """Handle GET_METRICS request by returning storage unit statistics.
 
         Returns:
             ZMQMessage containing storage unit ID, capacity, active keys,
             process RSS memory, and per-operation request stats.
         """
+        if type(route_stats) is not bool:
+            raise ValueError("route_stats must be a boolean")
         try:
             process_rss = psutil.Process().memory_info().rss
         except Exception:
@@ -613,6 +715,8 @@ class SimpleStorageUnit:
             "active_keys": self.storage_data.active_key_count,
             "process_rss_bytes": process_rss,
         }
+        if route_stats:
+            metrics["route_storage"] = self.storage_data.route_storage_stats()
 
         # Include per-operation stats if Prometheus metrics are enabled
         if self._metrics is not None:
@@ -701,10 +805,7 @@ class SimpleStorageUnit:
                 raise ValueError("unknown checkpoint phase")
 
             def write():
-                with open(path, "wb") as f:
-                    _CheckpointPickler(f, state).dump(state)
-                    f.flush()
-                    os.fsync(f.fileno())
+                _write_storage_checkpoint(path, state)
 
             prepared = (
                 phase == "prepare"
@@ -781,8 +882,7 @@ class SimpleStorageUnit:
         """
         path = data_parts.body["path"]
         try:
-            with open(path, "rb") as f:
-                data = pickle.load(f)
+            data = _read_storage_checkpoint(path)
 
             if data["storage_unit_size"] != self.storage_unit_size:
                 logger.warning(

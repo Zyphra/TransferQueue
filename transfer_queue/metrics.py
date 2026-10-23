@@ -390,14 +390,18 @@ class TQMetricsExporter:
         self._zmq_sockets[su_id] = sock
         return sock
 
-    def _query_storage_unit(self, su_info: ZMQServerInfo, su_id: str) -> dict[str, Any] | None:
+    def _query_storage_unit(
+        self, su_info: ZMQServerInfo, su_id: str, *, route_stats: bool = False
+    ) -> dict[str, Any] | None:
         """Send a synchronous GET_METRICS request to a single storage unit."""
+        if type(route_stats) is not bool:
+            raise ValueError("route_stats must be a boolean")
         try:
             sock = self._get_or_create_socket(su_id, su_info)
             request_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.GET_METRICS,
                 sender_id="metrics_collector",
-                body={},
+                body={"route_stats": True} if route_stats else {},
             )
             sock.send_multipart(request_msg.serialize())
             response_frames = sock.recv_multipart(copy=False)
