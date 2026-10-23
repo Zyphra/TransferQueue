@@ -913,6 +913,9 @@ class AsyncTransferQueueClient:
         partition_id: str,
         create: bool = False,
         socket: zmq.asyncio.Socket | None = None,
+        *,
+        data_fields: list[str] | None = None,
+        include_custom_meta: bool = True,
     ) -> BatchMeta:
         """Asynchronously retrieve BatchMeta by user-defined keys.
 
@@ -924,6 +927,8 @@ class AsyncTransferQueueClient:
             partition_id: The ID of the logical partition to search for keys.
             create:  If True, automatically create entries for missing keys.
             socket: ZMQ socket injected by @with_controller_socket.
+            data_fields: Optional field projection performed by the controller.
+            include_custom_meta: Include per-key user tags in the response.
 
         Returns:
             BatchMeta: Metadata for the requested keys.
@@ -948,6 +953,8 @@ class AsyncTransferQueueClient:
                     "keys": keys,
                     "partition_id": partition_id,
                     "create": create,
+                    "data_fields": data_fields,
+                    "include_custom_meta": include_custom_meta,
                 },
             )
             return response_msg.body.get("metadata", BatchMeta.empty())

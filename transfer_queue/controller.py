@@ -1379,6 +1379,7 @@ class TransferQueueController:
         batch_global_indexes: list[int],
         data_fields: list[str],
         mode: str = "fetch",
+        include_custom_meta: bool = True,
     ) -> BatchMeta:
         """
         Generate BatchMeta for specific samples in a partition.
@@ -1449,7 +1450,7 @@ class TransferQueueController:
                         )
                         production_status[in_range] = ready
 
-        custom_meta_dict = partition.get_custom_meta(batch_global_indexes)
+        custom_meta_dict = partition.get_custom_meta(batch_global_indexes) if include_custom_meta else {}
         custom_backend_meta = partition.get_field_custom_backend_meta(batch_global_indexes, data_fields)
 
         # Convert controller dict[int, dict] → BatchMeta list[dict] (aligned with batch_global_indexes)
@@ -1614,6 +1615,8 @@ class TransferQueueController:
         keys: list[str],
         partition_id: str,
         create: bool = False,
+        data_fields: list[str] | None = None,
+        include_custom_meta: bool = True,
     ) -> BatchMeta:
         """
         Retrieve BatchMeta from the controller using a list of keys.
@@ -1623,6 +1626,8 @@ class TransferQueueController:
             keys: List of keys to retrieve from the controller
             partition_id: Partition id to retrieve from the controller
             create: Whether to register new keys if not found.
+            data_fields: Optional field projection, applied before schema generation.
+            include_custom_meta: Include per-key user tags in the response.
 
         Returns:
             metadata: BatchMeta of the requested keys
@@ -1679,12 +1684,21 @@ class TransferQueueController:
         col_mask = partition.production_status[verified_global_indexes, :].sum(dim=0).reshape(-1) == len(
             verified_global_indexes
         )
-        data_fields = []
+        ready_fields = []
         for field_name, col_idx in partition.field_name_mapping.items():
             if col_idx < len(col_mask) and col_mask[col_idx]:
-                data_fields.append(field_name)
+                ready_fields.append(field_name)
 
-        return self.generate_batch_meta(partition_id, verified_global_indexes, data_fields, mode="force_fetch")
+        if data_fields is None:
+            data_fields = ready_fields
+        else:
+            data_fields = [name for name in data_fields if name in ready_fields]
+        # Keep the readiness of the original full-metadata lookup even when
+        # projection selects no fields; client-side selection retained it too.
+        mode = "fetch" if ready_fields else "force_fetch"
+        return self.generate_batch_meta(
+            partition_id, verified_global_indexes, data_fields, mode=mode, include_custom_meta=include_custom_meta
+        )
 
     def kv_retrieve_keys(
         self,
@@ -2124,6 +2138,8 @@ class TransferQueueController:
             keys=params["keys"],
             partition_id=params["partition_id"],
             create=params["create"],
+            data_fields=params.get("data_fields"),
+            include_custom_meta=params.get("include_custom_meta", True),
         )
         return self._make_response(
             request_msg,

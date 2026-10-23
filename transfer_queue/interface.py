@@ -397,7 +397,9 @@ def kv_batch_put(
     fields: TensorDict | None = None,
     tags: list[dict[str, Any]] | None = None,
     data_parser: Callable[[Any], Any] | None = None,
-) -> KVBatchMeta:
+    *,
+    return_metadata: bool = True,
+) -> KVBatchMeta | None:
     """Batch put multiple key-value pairs into the TransferQueue.
 
     This method stores multiple key-value entries in a single operation,
@@ -409,6 +411,8 @@ def kv_batch_put(
         fields: TensorDict containing batched data for all keys. Must have ``batch_size == len(keys)``.
             If not provided, only the associated tags will be updated.
         tags: List of metadata dictionaries, one per key.  Length must match the number of keys.
+        return_metadata: Return the full metadata snapshot. If False, skip
+            fetching existing field schemas and return None after the write.
         data_parser: Optional callable to parse raw reference data (e.g., URLs) into real content
             before storage. The input is a plain dict (not TensorDict) mapping field names to
             batched values. The parser  **must modify data in-place** without adding/removing
@@ -446,6 +450,7 @@ def kv_batch_put(
             fields=fields,
             tags=tags,
             data_parser=data_parser,
+            return_metadata=return_metadata,
         )
     )
 
@@ -700,7 +705,9 @@ async def async_kv_batch_put(
     fields: TensorDict | None = None,
     tags: list[dict[str, Any]] | None = None,
     data_parser: Callable[[Any], Any] | None = None,
-) -> KVBatchMeta:
+    *,
+    return_metadata: bool = True,
+) -> KVBatchMeta | None:
     """Asynchronously put multiple key-value pairs to TransferQueue in batch.
 
     This method stores multiple key-value pairs in a single operation, which is more
@@ -712,6 +719,8 @@ async def async_kv_batch_put(
         fields: TensorDict containing data for all keys. Must have batch_size == len(keys).
                 If not provided, will only update the newly given tags to the keys.
         tags: List of metadata tags, one for each key
+        return_metadata: Return the full metadata snapshot. If False, existing
+            field schemas are omitted; tags are fetched only for explicit updates.
         data_parser: Optional callable to parse reference data (e.g., URLs) into real
                      content. The input is a slice of the `fields` parameter passed to
                      kv_put / kv_batch_put, in plain dict format (not TensorDict),
@@ -758,7 +767,13 @@ async def async_kv_batch_put(
     tq_client = _maybe_create_tq_client()
 
     # 1. translate user-specified key to BatchMeta
-    batch_meta = await tq_client.async_kv_retrieve_meta(keys=keys, partition_id=partition_id, create=True)
+    batch_meta = await tq_client.async_kv_retrieve_meta(
+        keys=keys,
+        partition_id=partition_id,
+        create=True,
+        data_fields=None if return_metadata else [],
+        include_custom_meta=return_metadata or tags is not None,
+    )
 
     if batch_meta.size != len(keys):
         raise RuntimeError(
@@ -781,6 +796,9 @@ async def async_kv_batch_put(
     else:
         # Directly update custom_meta (tags) to controller
         await tq_client.async_set_custom_meta(batch_meta)
+
+    if not return_metadata:
+        return None
 
     fields_to_return = batch_meta.field_names
 
@@ -883,17 +901,13 @@ async def async_kv_batch_get(
     """
     tq_client = _maybe_create_tq_client()
 
-    batch_meta = await tq_client.async_kv_retrieve_meta(keys=keys, partition_id=partition_id, create=False)
+    fields_to_fetch = [select_fields] if isinstance(select_fields, str) else select_fields
+    batch_meta = await tq_client.async_kv_retrieve_meta(
+        keys=keys, partition_id=partition_id, create=False, data_fields=fields_to_fetch, include_custom_meta=False
+    )
 
     if batch_meta.size == 0:
         raise ValueError("keys or partition were not found!")
-
-    if select_fields is not None:
-        if isinstance(select_fields, str):
-            fields_to_fetch = [select_fields]
-        else:
-            fields_to_fetch = select_fields
-        batch_meta = batch_meta.select_fields(fields_to_fetch)
 
     if not batch_meta.is_ready:
         raise ValueError("Some fields are not ready in all the requested keys!")
