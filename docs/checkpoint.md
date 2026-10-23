@@ -50,6 +50,12 @@ def save_checkpoint(
 
 **Raises**: `RuntimeError` if `tq.init()` has not been called, or if any write step fails.
 
+`CheckpointStorageError` and `CheckpointStorageTimeoutError` retain their type,
+message, storage failures and timeout flag when transported through Ray or
+pickle. Their `checkpoint_future` is process-local: only the original error
+retains it for settlement and retirement; a transported copy has `None`.
+Receiving an error does not settle writers or authorize checkpoint publication.
+
 ---
 
 ### `tq.load_checkpoint`
