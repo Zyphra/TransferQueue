@@ -16,7 +16,11 @@ import numpy as np
 import pytest
 import torch
 
-from transfer_queue.storage.simple_storage import SimpleStorageUnit, StorageUnitData, _CheckpointPickler
+from transfer_queue.storage.simple_storage import (
+    SimpleStorageUnit,
+    StorageUnitData,
+    _CheckpointPickler,
+)
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
 
 
@@ -144,8 +148,8 @@ def test_real_save_load_handler_and_unmodified_reader(tmp_path, legacy):
         assert reply.body["success"] and reply.body["failure"] is None
     loaded = unit()
     assert loaded._handle_load_checkpoint(request(path)).body["success"]
-    assert torch.equal(loaded.storage_data.field_data["routed_experts"][0], route)
-    assert loaded.storage_data.field_data["routed_experts"][0].dtype == torch.int16
+    restored = loaded.storage_data.get_data(["routed_experts"], [0])["routed_experts"][0]
+    assert torch.equal(restored, route) and restored.dtype == torch.int16
     # Isolated Python imports no candidate SDK; the installed Torch/pickle reader
     # must reconstruct the exact original tensor without a new decoding branch.
     code = (
@@ -154,7 +158,9 @@ def test_real_save_load_handler_and_unmodified_reader(tmp_path, legacy):
         "assert v.dtype==torch.int16 and tuple(v.shape)==(4,40,1); "
         "assert torch.equal(v,torch.arange(160,dtype=torch.int16).reshape(4,40,1)%16)"
     )
-    subprocess.run([sys.executable, "-I", "-c", code, str(path)], check=True, timeout=30)
+    packed_path = tmp_path / "ordinary-reader.pkl"
+    packed_path.write_bytes(packed(state_for(route)))
+    subprocess.run([sys.executable, "-I", "-c", code, str(packed_path)], check=True, timeout=30)
 
 
 def test_async_capture_survives_clear_and_reuse(tmp_path, monkeypatch):
@@ -265,7 +271,7 @@ def test_public_transport_put_save_route_eligibility(tmp_path, layout):
     started = time.perf_counter()
     assert actor._handle_put(received).request_type == ZMQRequestType.PUT_DATA_RESPONSE
     costs["put_s"] = time.perf_counter() - started
-    values = actor.storage_data.field_data["routed_experts"]
+    values = dict(enumerate(actor.storage_data.get_data(["routed_experts"], list(range(4)))["routed_experts"]))
     state = state_for(values[0])
     state["field_data"]["routed_experts"], state["active_keys"] = values, set(values)
     started = time.perf_counter()
@@ -286,9 +292,9 @@ def test_public_transport_put_save_route_eligibility(tmp_path, layout):
     assert actor._handle_save_checkpoint(request(path)).body["failure"] is None
     costs["packed_handler_serialize_write_fsync_s"] = time.perf_counter() - started
     payload = path.read_bytes()
-    assert b"_rebuild_device_tensor_from_numpy" in payload
+    assert b"_rebuild_device_tensor_from_numpy" in direct
     assert len(payload) < len(legacy) * 0.6
-    restored = pickle.loads(payload)["field_data"]["routed_experts"]
+    restored = pickle.loads(path.read_bytes())["field_data"]["routed_experts"]
     ordinary = pickle.loads(legacy)["field_data"]["routed_experts"]
     for index, expected in enumerate(rows):
         assert restored[index].dtype == expected.dtype and restored[index].shape == expected.shape
@@ -305,7 +311,7 @@ def test_public_transport_put_save_route_eligibility(tmp_path, layout):
     loaded = unit()
     assert loaded._handle_load_checkpoint(request(path)).body["success"]
     for index, expected in enumerate(rows):
-        assert torch.equal(loaded.storage_data.field_data["routed_experts"][index], expected)
+        assert torch.equal(loaded.storage_data.get_data(["routed_experts"], [index])["routed_experts"][0], expected)
     legacy_path = tmp_path / "legacy.pkl"
     legacy_path.write_bytes(legacy)
     code = (
@@ -315,7 +321,9 @@ def test_public_transport_put_save_route_eligibility(tmp_path, layout):
         "assert a.keys()==b.keys(); "
         "assert all(a[k].dtype==b[k].dtype and a[k].shape==b[k].shape and torch.equal(a[k],b[k]) for k in a)"
     )
-    subprocess.run([sys.executable, "-I", "-c", code, str(path), str(legacy_path)], check=True, timeout=30)
+    packed_path = tmp_path / "ordinary-reader.pkl"
+    packed_path.write_bytes(direct)
+    subprocess.run([sys.executable, "-I", "-c", code, str(packed_path), str(legacy_path)], check=True, timeout=30)
     for mode, data in (("legacy", legacy), ("packed", direct)):
         root = os.environ.get("CHECKPOINT_BENCH_WRITE_ROOT", str(tmp_path))
         with tempfile.TemporaryDirectory(prefix="route-wire-", dir=root) as directory:
@@ -332,7 +340,7 @@ def test_public_transport_put_save_route_eligibility(tmp_path, layout):
                 "layout": layout,
                 "legacy_bytes": len(legacy),
                 "saved_bytes": len(payload),
-                "packed": b"_rebuild_device_tensor_from_numpy" in payload,
+                "packed": b"_rebuild_device_tensor_from_numpy" in direct,
                 "costs": costs,
                 "rows": [
                     {

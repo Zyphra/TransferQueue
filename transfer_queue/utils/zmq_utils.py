@@ -215,7 +215,7 @@ class ZMQMessage:
         return encode(msg_dict)
 
     @classmethod
-    def deserialize(cls, frames: list) -> "ZMQMessage":
+    def deserialize(cls, frames: list, *, retain_packed_routes=False) -> "ZMQMessage":
         """Deserialize: choose decoding path based on the first frame marker (zero-copy or pickle fallback)."""
         if not frames:
             raise ValueError("Empty frames received")
@@ -228,7 +228,7 @@ class ZMQMessage:
             raise ZMQMessageDecodeError(f"leading frame is empty; {describe_frames(frames)}")
 
         try:
-            result = decode(frames)
+            result = decode(frames, retain_packed_routes=retain_packed_routes)
         except Exception as e:
             raise ZMQMessageDecodeError(f"{type(e).__name__}: {e}; {describe_frames(frames)}") from e
 
