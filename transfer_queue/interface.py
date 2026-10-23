@@ -896,6 +896,10 @@ async def async_kv_batch_get(
     if batch_meta.size == 0:
         raise ValueError("keys or partition were not found!")
 
+    # Older controllers ignore the projection parameters in the request.
+    if fields_to_fetch is not None and set(batch_meta.field_names) - set(fields_to_fetch):
+        batch_meta = batch_meta.select_fields(fields_to_fetch)
+
     if not batch_meta.is_ready:
         raise ValueError("Some fields are not ready in all the requested keys!")
 

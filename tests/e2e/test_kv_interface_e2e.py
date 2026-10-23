@@ -1230,6 +1230,28 @@ def test_get_projects_metadata_before_controller_response(controller, tq_api, mo
     assert tq_api.kv_list(partition_id="projected")["projected"] == dict(zip(keys, tags, strict=True))
 
 
+def test_get_projection_preserves_older_controller_selection(controller, tq_api, monkeypatch):
+    keys = ["old_controller_0", "old_controller_1"]
+    scalars = torch.tensor([[0.0, -0.0], [-1.0, 2.0]], dtype=torch.float32)
+    tq_api.kv_batch_put(
+        keys=keys,
+        partition_id="old_controller",
+        fields=TensorDict({"scalar": scalars, "unused": torch.ones(2, 8)}, batch_size=2),
+    )
+    client = tq.get_client()
+    request = client._request_controller
+
+    async def older_controller_request(**kwargs):
+        if kwargs["request_type"] == ZMQRequestType.KV_RETRIEVE_META:
+            kwargs["body"] = {name: kwargs["body"][name] for name in ("keys", "partition_id", "create")}
+        return await request(**kwargs)
+
+    monkeypatch.setattr(client, "_request_controller", older_controller_request)
+    actual = tq_api.kv_batch_get(keys=keys, partition_id="old_controller", select_fields="scalar")
+    assert set(actual.keys()) == {"scalar"}
+    assert_tensor_equal(actual["scalar"].view(torch.uint8), scalars.view(torch.uint8))
+
+
 @pytest.mark.parametrize("selected", [["ready"], ["partial"], ["missing"], [], None])
 def test_projected_metadata_matches_legacy_selection(controller, tq_api, selected):
     keys = ["row0", "row1"]
