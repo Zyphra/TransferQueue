@@ -169,7 +169,7 @@ class StorageUnitData:
         return len(self._active_keys)
 
     def route_storage_stats(self) -> dict:
-        stats = dict(
+        stats: dict[str, Any] = dict(
             row_count=0,
             packed_rows=0,
             unpacked_rows=0,
