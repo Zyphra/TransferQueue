@@ -367,14 +367,21 @@ Please kindly cite our paper if you find this repo is useful:
 
 ### Bounded asynchronous checkpoint storage
 
-SimpleStorage checkpoint writers store nonoverlapping contiguous CPU `routed_experts`
-int16 tensors as uint8 when every value is in 0..255. Ordinary pickle/Torch
-readers reconstruct the original int16 dtype, shape and values, including older
-readers; existing checkpoints remain readable. Live storage and snapshot byte
-accounting stay unchanged. Disjoint route rows from decoded dense/jagged batches
-are eligible. Overlapping views, cross-field backing, out-of-range values and
-uncertain ownership use ordinary serialization. Packing adds a range scan and
-a temporary uint8 copy in the writer; it is not a bound on process RSS.
+SimpleStorage packs independent CPU `routed_experts` cells into live uint8
+storage and transport frames while retaining int16 controller schemas and
+restoring int16 consumer values. IDs in 0..255 fit; a -1 sentinel also fits
+when all other IDs are at most 254. Wider ranges, unsupported values,
+overlapping or cross-field aliases retain their previous representation.
+No token, mask, log probability or route entries are dropped. All clients
+and storage processes must use the same package version; new readers accept
+old unpacked frames and checkpoints. Checkpoint packing restores the logical
+dtype through ordinary Torch reducers, including for the shifted sentinel.
+Disjoint route rows from decoded dense/jagged batches remain eligible.
+
+Snapshot ownership accounting traverses TensorDict metadata through its public
+dictionary projection. Unknown payload ownership still selects synchronous
+storage. Each storage cut logs its accounted bytes, budget and async decision
+before starting a write; a larger budget alone cannot admit unknown ownership.
 
 For detached SimpleStorage saves, committed `metadata.json` includes an optional
 `storage_checkpoint` receipt: aggregate async/fallback mode and the existing

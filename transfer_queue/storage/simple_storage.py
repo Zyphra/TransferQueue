@@ -28,11 +28,13 @@ import psutil
 import ray
 import torch
 import zmq
+from tensordict import TensorDictBase
 
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
+from transfer_queue.utils.route_codec import PackedRoutes, pack_route_fields, packable_route_ids
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -57,42 +59,7 @@ class _CheckpointPickler(pickle.Pickler):
 
     def __init__(self, stream, state):
         super().__init__(stream, protocol=pickle.HIGHEST_PROTOCOL)
-        self.routes = {id(value) for value in state["field_data"].get("routed_experts", {}).values()}
-        if not self.routes:
-            return
-        pending, seen, owners = [state], set(), {}
-        while pending:
-            value = pending.pop()
-            if id(value) in seen:
-                continue
-            seen.add(id(value))
-            if type(value) is torch.Tensor:
-                if value.device.type != "cpu" or value.layout != torch.strided or value.is_nested:
-                    self.routes.clear()
-                    break
-                storage = value.untyped_storage()
-                identity = (storage.data_ptr(), storage.nbytes())
-                owners.setdefault(identity, []).append(value)
-            elif type(value) is dict:
-                pending.extend(value.keys())
-                pending.extend(value.values())
-            elif type(value) in (list, tuple, set, frozenset):
-                pending.extend(value)
-            elif type(value) not in (str, bytes, bytearray, int, float, bool, type(None)):
-                # Opaque objects and NumPy views can conceal shared tensor storage.
-                self.routes.clear()
-                break
-        for aliases in owners.values():
-            if len(aliases) <= 1:
-                continue
-            # Storage puts unbind dense/jagged batches into disjoint row views.
-            # Overlap or another field's view must retain ordinary serialization.
-            route_rows = all(
-                id(value) in self.routes and value.dtype == torch.int16 and value.is_contiguous() for value in aliases
-            )
-            spans = sorted((value.storage_offset(), value.storage_offset() + value.numel()) for value in aliases)
-            if not route_rows or any(left[1] > right[0] for left, right in zip(spans, spans[1:], strict=False)):
-                self.routes.difference_update(id(value) for value in aliases)
+        self.routes = packable_route_ids(state["field_data"])
 
     def reducer_override(self, value):
         if id(value) not in self.routes:
@@ -140,7 +107,7 @@ class StorageUnitData:
         """Number of active keys currently stored."""
         return len(self._active_keys)
 
-    def get_data(self, fields: list[str], global_indexes: list) -> dict[str, list]:
+    def get_data(self, fields: list[str], global_indexes: list, *, packed_routes: bool = False) -> dict[str, list]:
         """Get data by global index keys.
 
         Args:
@@ -158,6 +125,10 @@ class StorageUnitData:
                 )
             try:
                 result[field] = [self.field_data[field][k] for k in global_indexes]
+                if not packed_routes:
+                    result[field] = [
+                        value.restore() if isinstance(value, PackedRoutes) else value for value in result[field]
+                    ]
             except KeyError as e:
                 raise KeyError(f"StorageUnitData get_data: key {e} not found in field '{field}'") from e
         return result
@@ -213,14 +184,20 @@ class StorageUnitData:
         }
         active = self._active_keys & indexes
         stores: set[tuple[int, int] | int] = set()
-        pending, seen, size = [fields, active], set(), 0
+        pending, seen, size, projections = [fields, active], set(), 0, []
         while pending:
             value = pending.pop()
             if id(value) in seen:
                 continue
             seen.add(id(value))
             size += sys.getsizeof(value)
-            if isinstance(value, torch.Tensor):
+            if isinstance(value, PackedRoutes):
+                pending.append(value.data)
+            elif isinstance(value, TensorDictBase):
+                # Projected containers must outlive the identity-based walk.
+                projections.append(value.to_dict())
+                pending.append(projections[-1])
+            elif isinstance(value, torch.Tensor):
                 if type(value) is not torch.Tensor or value.device.type != "cpu" or value.is_nested:
                     return {"field_data": fields, "active_keys": active}, None
                 try:
@@ -411,7 +388,7 @@ class SimpleStorageUnit:
                 identity = messages[0]
                 serialized_msg = messages[1:]
 
-                request_msg = ZMQMessage.deserialize(serialized_msg)
+                request_msg = ZMQMessage.deserialize(serialized_msg, retain_packed_routes=True)
                 operation = request_msg.request_type
 
                 try:
@@ -523,7 +500,7 @@ class SimpleStorageUnit:
                                 f"data_parser changed the number of elements for key '{k}': "
                                 f"expected {orig_len}, got {new_len}"
                             )
-                self.storage_data.put_data(field_data, global_indexes)
+                self.storage_data.put_data(pack_route_fields(field_data), global_indexes)
 
             # After put operation finish, send a message to the client
             response_msg = ZMQMessage.create(
@@ -560,7 +537,7 @@ class SimpleStorageUnit:
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_get"
             ):
-                result_data = self.storage_data.get_data(fields, global_indexes)
+                result_data = self.storage_data.get_data(fields, global_indexes, packed_routes=True)
 
             response_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.GET_DATA_RESPONSE,  # type: ignore[arg-type]
@@ -734,6 +711,14 @@ class SimpleStorageUnit:
                 and retained_bytes is not None
                 and retained_bytes <= data_parts.body["max_snapshot_bytes"]
             )
+            logger.info(
+                "[%s]: checkpoint storage cut phase=%s async=%s retained_bytes=%s max_snapshot_bytes=%s",
+                self.storage_unit_id,
+                phase,
+                prepared,
+                retained_bytes,
+                data_parts.body.get("max_snapshot_bytes"),
+            )
             future: Future[None] = Future()
             self._checkpoint_future, self._checkpoint_path = future, path
             if prepared:
@@ -824,7 +809,7 @@ class SimpleStorageUnit:
                 if retained:
                     candidate[field_name] = retained
             active_keys = set().union(*(values.keys() for values in candidate.values()))
-            self.storage_data.field_data = candidate
+            self.storage_data.field_data = pack_route_fields(candidate)
             self.storage_data._active_keys = active_keys
 
             logger.info(

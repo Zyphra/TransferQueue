@@ -36,12 +36,14 @@ from msgspec import msgpack
 from tensordict import TensorDictBase
 
 from transfer_queue.utils.logging_utils import get_logger
+from transfer_queue.utils.route_codec import PackedRoutes
 
 CUSTOM_TYPE_PICKLE = 1
 CUSTOM_TYPE_CLOUDPICKLE = 2
 CUSTOM_TYPE_TENSOR = 3  # For tensor with buffer reference
 CUSTOM_TYPE_NESTED_TENSOR = 4  # For nested tensor (strided or jagged)
 CUSTOM_TYPE_NUMPY = 5  # For numpy ndarray with buffer reference
+CUSTOM_TYPE_PACKED_ROUTES = 6
 
 # 0xC1 is permanently reserved (invalid) in msgpack spec — safe to use as pickle fallback sentinel.
 _PICKLE_FALLBACK_SENTINEL = b"\xc1\xfe\xed"
@@ -106,6 +108,9 @@ class MsgpackEncoder:
         - numpy.ndarray: Convert to tensor for unified handling
 
         """
+        if isinstance(obj, PackedRoutes):
+            meta = (self._encode_regular_tensor_meta(obj.data), obj.offset)
+            return msgpack.Ext(CUSTOM_TYPE_PACKED_ROUTES, pickle.dumps(meta, protocol=pickle.HIGHEST_PROTOCOL))
         if isinstance(obj, torch.Tensor):
             return self._encode_tensor(obj)
 
@@ -248,7 +253,8 @@ class MsgpackDecoder:
     threads and async coroutines.
     """
 
-    def __init__(self):
+    def __init__(self, *, retain_packed_routes=False):
+        self.retain_packed_routes = retain_packed_routes
         self.decoder = msgpack.Decoder(ext_hook=self.ext_hook)
 
     @property
@@ -378,12 +384,17 @@ class MsgpackDecoder:
         if code == CUSTOM_TYPE_NUMPY:
             meta = pickle.loads(data)
             return self._decode_numpy(meta)
+        if code == CUSTOM_TYPE_PACKED_ROUTES:
+            meta, offset = pickle.loads(data)
+            value = PackedRoutes(self._decode_tensor(meta), offset=offset)
+            return value if self.retain_packed_routes else value.restore()
 
         raise NotImplementedError(f"Extension type code {code} is not supported")
 
 
 _encoder = MsgpackEncoder()
 _decoder = MsgpackDecoder()
+_storage_decoder = MsgpackDecoder(retain_packed_routes=True)
 
 
 # Values msgpack cannot represent. None of these derive from ValueError: OverflowError is
@@ -430,7 +441,7 @@ def encode(obj: Any) -> list[bytestr]:
         return [_PICKLE_FALLBACK_SENTINEL, pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)]
 
 
-def decode(frames: list) -> Any:
+def decode(frames: list, *, retain_packed_routes=False) -> Any:
     """Decode frames produced by encode.
 
     Transparently handles both the msgpack zero-copy path and the pickle
@@ -438,7 +449,7 @@ def decode(frames: list) -> Any:
     """
     if len(frames) >= 2 and _is_pickle_fallback(frames[0]):
         return pickle.loads(frames[1])
-    return _decoder.decode(frames)
+    return (_storage_decoder if retain_packed_routes else _decoder).decode(frames)
 
 
 # Packed buffer layout:

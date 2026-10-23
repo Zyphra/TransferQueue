@@ -32,6 +32,7 @@ from tensordict import NonTensorStack, TensorDict
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.managers.base import StorageManager, StorageManagerFactory
 from transfer_queue.utils.logging_utils import get_logger
+from transfer_queue.utils.route_codec import pack_route_fields
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -389,7 +390,11 @@ class AsyncSimpleStorageManager(StorageManager):
             request_type=ZMQRequestType.PUT_DATA,  # type: ignore[arg-type]
             sender_id=self.storage_manager_id,
             receiver_id=target_storage_unit,
-            body={"global_indexes": global_indexes, "data": storage_data, "data_parser": data_parser},
+            body={
+                "global_indexes": global_indexes,
+                "data": pack_route_fields(storage_data) if data_parser is None else storage_data,
+                "data_parser": data_parser,
+            },
         )
 
         try:
