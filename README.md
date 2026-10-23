@@ -471,6 +471,24 @@ manifest with input/output digests. A directory is finished only when
 `manifest.json` exists and `INCOMPLETE` is absent. Failed output stays visibly
 incomplete; retries use a new directory and never overwrite evidence.
 
+Independently verify the finished archive before relying on its contents:
+
+```bash
+python -m transfer_queue.lean_archive verify \
+  --archive new-archive --manifest-sha256 "$EXTRACTION_MANIFEST_SHA" \
+  --plan plan.json --plan-sha256 "$PLAN_SHA" \
+  --max-uncompressed-bytes "$LEAN_OUTPUT_BOUND" --output verified.json
+```
+
+This opens no native pickle. It independently decompresses through gzip EOF/CRC,
+checks every ordered key/global-index against the plan, and compares row count,
+key digest, compressed digest/size and uncompressed-record digest with the pinned
+extraction manifest. Missing/extra rows, corrupt/truncated gzip, changed files,
+misbound units/plans and incomplete output fail without a passing report. The
+total decompressed byte bound is required; individual records default to at most
+16 MiB (`--max-record-bytes`). Successful byte verification does not prove the
+historical episode denominator, source-pickle equality or cleanup eligibility.
+
 `audit-index --plan ... --plan-sha256 ... --index ... --index-sha256 ... --output ...`
 joins a separately authenticated JSONL export index by exact row key and controller
 digest. Index entries require a lowercase record SHA-256 and explicit

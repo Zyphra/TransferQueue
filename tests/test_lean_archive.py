@@ -290,3 +290,122 @@ def test_plan_cli_reads_native_partition_snapshot_and_binds_unit_manifest(tmp_pa
     assert result["rows"][0]["key"] == "p_0_0"
     assert result["storage_units"] == [{"position": 0, "storage_unit_id": "unit"}]
     assert result["controller"]["sha256"] == hashlib.sha256(controller.read_bytes()).hexdigest()
+
+
+@pytest.fixture
+def extracted_archive(tmp_path, row, fields):
+    plan = tmp_path / "plan.json"
+    plan.write_text(json.dumps(plan_for(row)))
+    unit = tmp_path / "unit.pkl"
+    unit.write_bytes(pickle.dumps({"field_data": fields, "storage_unit_id": "unit"}))
+    archive = tmp_path / "archive"
+    main(
+        [
+            "extract",
+            "--plan",
+            str(plan),
+            "--plan-sha256",
+            hashlib.sha256(plan.read_bytes()).hexdigest(),
+            "--unit",
+            str(unit),
+            "--max-unit-bytes",
+            str(unit.stat().st_size),
+            "--unit-position",
+            "0",
+            "--output",
+            str(archive),
+        ]
+    )
+    return plan, archive
+
+
+def verify_args(plan, archive, output):
+    return [
+        "verify",
+        "--plan",
+        str(plan),
+        "--plan-sha256",
+        hashlib.sha256(plan.read_bytes()).hexdigest(),
+        "--archive",
+        str(archive),
+        "--manifest-sha256",
+        hashlib.sha256((archive / "manifest.json").read_bytes()).hexdigest(),
+        "--max-uncompressed-bytes",
+        "1048576",
+        "--output",
+        str(output),
+    ]
+
+
+def test_verify_independently_decompresses_without_native_pickle_read(extracted_archive, tmp_path, monkeypatch):
+    import transfer_queue.lean_archive as module
+
+    plan, archive = extracted_archive
+    monkeypatch.setattr(module, "load_pickle", lambda *args: pytest.fail("verification reopened native state"))
+    output = tmp_path / "verified.json"
+    main(verify_args(plan, archive, output))
+    result = json.loads(output.read_bytes())
+    assert result["status"] == "PASS_ARCHIVE_BYTES_AND_PLANNED_ROWS"
+    assert result["verified_rows"] == 1 and result["episode_coverage_proved"] is False
+    assert (
+        result["uncompressed_records_sha256"]
+        == hashlib.sha256(gzip.decompress((archive / "completed.jsonl.gz").read_bytes())).hexdigest()
+    )
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "crc",
+        "truncated",
+        "key",
+        "records_digest",
+        "keys_digest",
+        "count",
+        "extra",
+        "missing",
+        "incomplete",
+        "plan_binding",
+        "bounds",
+    ],
+)
+def test_verify_refuses_corrupt_truncated_or_misbound_archives(extracted_archive, tmp_path, damage):
+    plan, archive = extracted_archive
+    path = archive / "completed.jsonl.gz"
+    manifest = json.loads((archive / "manifest.json").read_bytes())
+    payload = path.read_bytes()
+    if damage == "crc":
+        payload = payload[:-8] + bytes([payload[-8] ^ 1]) + payload[-7:]
+    elif damage == "truncated":
+        payload = payload[:-4]
+    elif damage == "key":
+        record = json.loads(gzip.decompress(payload))
+        record["key"] = "foreign_0_0"
+        raw = json.dumps(record).encode() + b"\n"
+        payload = gzip.compress(raw, mtime=0)
+        manifest["uncompressed_records_sha256"] = hashlib.sha256(raw).hexdigest()
+        manifest["keys_sha256"] = hashlib.sha256(b'"foreign_0_0"\n').hexdigest()
+    elif damage == "records_digest":
+        manifest["uncompressed_records_sha256"] = "0" * 64
+    elif damage == "keys_digest":
+        manifest["keys_sha256"] = "0" * 64
+    elif damage == "count":
+        manifest["completed_rows"] += 1
+    elif damage == "extra":
+        payload = gzip.compress(gzip.decompress(payload) * 2, mtime=0)
+    elif damage == "missing":
+        payload = gzip.compress(b"", mtime=0)
+    elif damage == "incomplete":
+        (archive / "INCOMPLETE").touch()
+    elif damage == "plan_binding":
+        manifest["plan_sha256"] = "0" * 64
+    path.write_bytes(payload)
+    manifest.update(output_bytes=len(payload), output_sha256=hashlib.sha256(payload).hexdigest())
+    (archive / "manifest.json").write_text(json.dumps(manifest))
+    output = tmp_path / "should-not-pass.json"
+    argv = verify_args(plan, archive, output)
+    if damage == "bounds":
+        argv[argv.index("--max-uncompressed-bytes") + 1] = "1"
+    with pytest.raises((ValueError, OSError, EOFError)):
+        main(argv)
+    assert not output.exists()

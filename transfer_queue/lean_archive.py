@@ -390,6 +390,89 @@ def audit_index(plan, records):
     }
 
 
+def verify_archive(archive, plan, plan_sha256, manifest_sha256, max_bytes, max_record_bytes):
+    """Independently decompress the finished artifact; never reopen its native pickle."""
+    archive = Path(archive)
+    if archive.is_symlink() or (archive / "INCOMPLETE").exists():
+        raise ValueError("archive is a symlink or incomplete")
+    manifest = read_json(archive / "manifest.json", manifest_sha256)
+    if (
+        plan["schema"] != PLAN_SCHEMA
+        or manifest["schema"] != "transfer_queue.lean_unit_manifest.v1"
+        or manifest["plan_sha256"] != plan_sha256
+    ):
+        raise ValueError("archive manifest/plan binding mismatch")
+    position = manifest["unit_position"]
+    if (
+        type(position) is not int
+        or not 0 <= position < plan["units"]
+        or manifest["storage_unit_id"] != plan["storage_units"][position]["storage_unit_id"]
+    ):
+        raise ValueError("archive unit identity mismatch")
+    if max_bytes <= 0 or max_record_bytes <= 0:
+        raise ValueError("verification byte bounds must be positive")
+    expected = sorted(
+        (row for row in plan["rows"] if row["unit_position"] == position), key=lambda row: row["global_index"]
+    )
+    if len({row["key"] for row in expected}) != len(expected) or len({row["global_index"] for row in expected}) != len(
+        expected
+    ):
+        raise ValueError("duplicate planned row identity")
+    if manifest["completed_rows"] != len(expected):
+        raise ValueError("manifest row count differs from plan")
+    keys, records, count_bytes = hashlib.sha256(), hashlib.sha256(), 0
+    path = archive / "completed.jsonl.gz"
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode) or before.st_size != manifest["output_bytes"]:
+        raise ValueError("archive is not a regular file with the declared size")
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb", buffering=0) as raw:
+        if file_identity(before) != file_identity(os.fstat(raw.fileno())):
+            raise ValueError("archive changed before opening")
+        hashing = _HashingReader(raw)
+        with gzip.GzipFile(fileobj=io.BufferedReader(hashing), mode="rb") as zipped:
+            for row in expected:
+                line = zipped.readline(min(max_record_bytes, max_bytes - count_bytes) + 1)
+                count_bytes += len(line)
+                if len(line) > max_record_bytes or count_bytes > max_bytes or not line.endswith(b"\n"):
+                    raise ValueError("archive row is missing, truncated or exceeds verification bounds")
+                record = json.loads(line)
+                if (
+                    record["schema"] != RECORD_SCHEMA
+                    or record["key"] != row["key"]
+                    or record["global_index"] != row["global_index"]
+                ):
+                    raise ValueError("decompressed row identity differs from plan")
+                keys.update(canonical(record["key"]) + b"\n")
+                records.update(line)
+            if zipped.read(1):
+                raise ValueError("archive contains extra records")
+        digest = hashing.digest.hexdigest()
+        if file_identity(before) != file_identity(os.fstat(raw.fileno())):
+            raise ValueError("archive changed during verification")
+    if file_identity(before) != file_identity(path.lstat()) or (archive / "INCOMPLETE").exists():
+        raise ValueError("archive changed during verification")
+    if (
+        digest != manifest["output_sha256"]
+        or keys.hexdigest() != manifest["keys_sha256"]
+        or records.hexdigest() != manifest["uncompressed_records_sha256"]
+    ):
+        raise ValueError("archive compressed/key/uncompressed-record digest mismatch")
+    return {
+        "status": "PASS_ARCHIVE_BYTES_AND_PLANNED_ROWS",
+        "unit_position": position,
+        "verified_rows": len(expected),
+        "uncompressed_bytes": count_bytes,
+        "output_sha256": digest,
+        "keys_sha256": keys.hexdigest(),
+        "uncompressed_records_sha256": records.hexdigest(),
+        "plan_sha256": plan_sha256,
+        "manifest_sha256": manifest_sha256,
+        "episode_coverage_proved": False,
+        "limits": "Verifies archived bytes and planned row identities, not original pickle equality, "
+        "completed-episode denominator, numerical restore or cleanup authorization.",
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -422,6 +505,14 @@ def main(argv=None):
     audit.add_argument("--index", required=True, type=Path)
     audit.add_argument("--index-sha256", required=True)
     audit.add_argument("--output", required=True, type=Path)
+    verify = commands.add_parser("verify", help="Independently decompress and verify a finished lean archive")
+    verify.add_argument("--archive", required=True, type=Path)
+    verify.add_argument("--manifest-sha256", required=True)
+    verify.add_argument("--plan", required=True, type=Path)
+    verify.add_argument("--plan-sha256", required=True)
+    verify.add_argument("--max-uncompressed-bytes", required=True, type=int)
+    verify.add_argument("--max-record-bytes", type=int, default=16 * 1024 * 1024)
+    verify.add_argument("--output", required=True, type=Path)
     args = parser.parse_args(argv)
     if args.command == "plan":
         state, source = load_pickle(args.controller, args.max_controller_bytes, args.controller_sha256)
@@ -444,6 +535,17 @@ def main(argv=None):
         if hashlib.sha256(raw).hexdigest() != args.index_sha256:
             raise ValueError("export index SHA-256 mismatch")
         result = audit_index(plan, (json.loads(line) for line in raw.splitlines()))
+        write_json(args.output, result)
+    elif args.command == "verify":
+        plan = read_json(args.plan, args.plan_sha256)
+        result = verify_archive(
+            args.archive,
+            plan,
+            args.plan_sha256,
+            args.manifest_sha256,
+            args.max_uncompressed_bytes,
+            args.max_record_bytes,
+        )
         write_json(args.output, result)
     else:
         plan = read_json(args.plan, args.plan_sha256)
