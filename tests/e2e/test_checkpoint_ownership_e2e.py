@@ -25,6 +25,7 @@ from tensordict import TensorDict
 
 import transfer_queue as tq
 from transfer_queue import interface
+from transfer_queue.storage.simple_storage import _read_storage_checkpoint
 
 
 @pytest.fixture(scope="module")
@@ -90,8 +91,7 @@ def physical_state(path):
     states = []
     for entry in sorted(entries, key=lambda entry: entry["position"]):
         file = path / "simple_storage" / f"su_{entry['position']}_{entry['storage_unit_id']}.pkl"
-        with file.open("rb") as f:
-            states.append(pickle.load(f))
+        states.append(_read_storage_checkpoint(file))
     return states
 
 

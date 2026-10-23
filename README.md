@@ -383,6 +383,25 @@ dictionary projection. Unknown payload ownership still selects synchronous
 storage. Each storage cut logs its accounted bytes, budget and async decision
 before starting a write; a larger budget alone cannot admit unknown ownership.
 
+Each existing per-unit checkpoint file streams the same logical pickle through
+zstd level 1, using the existing `TQ_NUM_THREADS` budget for parallel compression.
+The versioned header records the compressed length and SHA256; the frame also
+has a zstd checksum. Readers validate the complete frame before replacing live
+storage and accept legacy raw pickle shards. New compressed files require the
+new reader; route reducers alone remain compatible with ordinary Torch pickle.
+The existing concurrent unit fanout, async ownership, fsync and directory
+publication stay in charge: a failed or incomplete unit cannot publish a cut.
+This does not establish a production compression ratio or commit-time bound.
+
+The existing `GET_METRICS` request accepts optional `route_stats: true` and
+returns `route_storage`: packed/unpacked/unknown row counts, known logical and
+stored view bytes, and deduplicated backing-store bytes for routed experts.
+It reads tensor metadata only, does not unpack values, and excludes other
+fields, allocator overhead and RSS. Unknown rows remain explicit. Ordinary
+requests and background collection leave this scan off. The existing
+`TQMetricsExporter._query_storage_unit(..., route_stats=True)` sends the bounded
+query without starting a monitor; its default remains unchanged.
+
 For detached SimpleStorage saves, committed `metadata.json` includes an optional
 `storage_checkpoint` receipt: aggregate async/fallback mode and the existing
 per-unit ID, IP, preparation flag, accounted retained bytes (or `null` when

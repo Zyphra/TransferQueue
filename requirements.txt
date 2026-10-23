@@ -7,3 +7,4 @@ msgspec
 psutil
 omegaconf
 prometheus_client>=0.20.0
+zstandard>=0.25.0
