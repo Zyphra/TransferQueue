@@ -184,7 +184,7 @@ class StorageUnitData:
         }
         active = self._active_keys & indexes
         stores: set[tuple[int, int] | int] = set()
-        pending, seen, size = [fields, active], set(), 0
+        pending, seen, size, projections = [fields, active], set(), 0, []
         while pending:
             value = pending.pop()
             if id(value) in seen:
@@ -194,7 +194,9 @@ class StorageUnitData:
             if isinstance(value, PackedRoutes):
                 pending.append(value.data)
             elif isinstance(value, TensorDictBase):
-                pending.append(value.to_dict())
+                # Projected containers must outlive the identity-based walk.
+                projections.append(value.to_dict())
+                pending.append(projections[-1])
             elif isinstance(value, torch.Tensor):
                 if type(value) is not torch.Tensor or value.device.type != "cpu" or value.is_nested:
                     return {"field_data": fields, "active_keys": active}, None

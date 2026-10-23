@@ -40,7 +40,7 @@ def packable_route_ids(fields, *, reject_identity_aliases=False):
     routes = {id(value) for value in (rows.values() if isinstance(rows, dict) else rows) if type(value) is torch.Tensor}
     if not routes:
         return set()
-    pending, seen, owners, counts = [fields], set(), {}, {}
+    pending, seen, owners, counts, projections = [fields], set(), {}, {}, []
     while pending:
         value = pending.pop()
         if type(value) is torch.Tensor:
@@ -57,7 +57,9 @@ def packable_route_ids(fields, *, reject_identity_aliases=False):
             identity = (storage.data_ptr(), storage.nbytes())
             owners.setdefault(identity, []).append(value)
         elif isinstance(value, TensorDictBase):
-            pending.append(value.to_dict())
+            # Keep projected containers alive while their identities are in seen.
+            projections.append(value.to_dict())
+            pending.append(projections[-1])
         elif type(value) is dict:
             pending.extend(value.keys())
             pending.extend(value.values())

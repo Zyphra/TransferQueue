@@ -5,10 +5,11 @@
 import pickle
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
-from tensordict import NonTensorStack, TensorDict
+from tensordict import NonTensorData, NonTensorStack, TensorDict
 
 from transfer_queue.storage.simple_storage import SimpleStorageUnit, StorageUnitData
 from transfer_queue.utils.route_codec import PackedRoutes, pack_route_fields
@@ -129,3 +130,14 @@ def test_packed_checkpoint_uses_ordinary_torch_reader(tmp_path, offset):
 def test_invalid_physical_encoding_is_refused(dtype, offset):
     with pytest.raises(ValueError):
         PackedRoutes(torch.tensor([0, 1], dtype=dtype), offset=offset)
+
+
+def test_many_tensordict_projections_do_not_hide_unknown_ownership():
+    metadata = [TensorDict({"value": index}, batch_size=[]) for index in range(128)]
+    metadata.append(TensorDict({"opaque": NonTensorData(SimpleNamespace(value=1))}, batch_size=[]))
+    data = StorageUnitData(256)
+    data.put_data({"metadata": metadata}, list(range(len(metadata))))
+    _, retained = data.checkpoint_snapshot(set(range(len(metadata))))
+    assert retained is None
+    fields = {"routed_experts": [torch.arange(16, dtype=torch.int16)], "metadata": metadata}
+    assert type(pack_route_fields(fields)["routed_experts"][0]) is torch.Tensor
