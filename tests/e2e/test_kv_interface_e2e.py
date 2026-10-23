@@ -1340,9 +1340,11 @@ def test_projected_write_creates_keys_and_keeps_default_receipt(controller, tq_a
     assert receipt.keys == ["new"] and receipt.tags == [{"version": 2}] and receipt.fields == ["scalar"]
 
 
-def test_get_projection_preserves_jagged_and_non_tensor_rows(controller, tq_api):
+def test_get_projection_preserves_jagged_and_non_tensor_rows(controller, tq_api, backend_name):
     keys = ["jagged_0", "jagged_1", "jagged_2"]
-    rows = [torch.arange(size, dtype=torch.int64) for size in (0, 2, 5)]
+    # Mooncake's buffer API rejects null pointers for zero-byte tensors.
+    sizes = (1, 2, 5) if backend_name == "MooncakeStore" else (0, 2, 5)
+    rows = [torch.arange(size, dtype=torch.int64) for size in sizes]
     contexts = [{"uid": key, "offset": index} for index, key in enumerate(keys)]
     fields = TensorDict(
         {
