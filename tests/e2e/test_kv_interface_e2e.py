@@ -197,6 +197,14 @@ def assert_tensor_equal(tensor_a, tensor_b, msg=""):
         assert torch.equal(tensor_a, tensor_b), f"{msg} Tensors are not equal: {tensor_a} vs {tensor_b}"
 
 
+def assert_tensor_bytes_equal(actual, expected):
+    """Compare dense or jagged rows without losing signed-zero evidence."""
+    assert actual.dtype == expected.dtype
+    for observed, reference in zip(actual.unbind(), expected.unbind(), strict=True):
+        assert observed.shape == reference.shape
+        assert torch.equal(observed.contiguous().view(torch.uint8), reference.contiguous().view(torch.uint8))
+
+
 def assert_tensor_close(tensor_a, tensor_b, rtol=1e-5, atol=1e-8, msg=""):
     """Assert two tensors are close, handling nested vs dense comparisons."""
     if (isinstance(tensor_a, torch.Tensor) and tensor_a.is_nested) or (
@@ -1214,7 +1222,7 @@ def test_get_projects_metadata_before_controller_response(controller, tq_api, mo
 
     monkeypatch.setattr(client, "_request_controller", record_request)
     actual = tq_api.kv_batch_get(keys=list(reversed(keys)), partition_id="projected", select_fields="scalar")
-    assert_tensor_equal(actual["scalar"].view(torch.uint8), scalars.flip(0).view(torch.uint8))
+    assert_tensor_bytes_equal(actual["scalar"], scalars.flip(0))
     body, response = responses.pop()
     projected = response.body["metadata"]
     assert body["data_fields"] == ["scalar"] and body["include_custom_meta"] is False
@@ -1249,7 +1257,7 @@ def test_get_projection_preserves_older_controller_selection(controller, tq_api,
     monkeypatch.setattr(client, "_request_controller", older_controller_request)
     actual = tq_api.kv_batch_get(keys=keys, partition_id="old_controller", select_fields="scalar")
     assert set(actual.keys()) == {"scalar"}
-    assert_tensor_equal(actual["scalar"].view(torch.uint8), scalars.view(torch.uint8))
+    assert_tensor_bytes_equal(actual["scalar"], scalars)
 
 
 @pytest.mark.parametrize("selected", [["ready"], ["partial"], ["missing"], [], None])
@@ -1317,7 +1325,7 @@ def test_write_projects_schemas_preserving_values_tags_and_readiness(controller,
     assert metadata.field_schema == {"old": {}} and metadata._custom_backend_meta == [{}, {}]
     assert metadata.custom_meta == tags
     actual = tq_api.kv_batch_get(keys=keys, partition_id="scalar_write")
-    assert_tensor_equal(actual["scalar"].view(torch.uint8), scalars.view(torch.uint8))
+    assert_tensor_bytes_equal(actual["scalar"], scalars)
     assert_tensor_equal(actual["old"], torch.ones(2, 8))
     listed = tq_api.kv_list(partition_id="scalar_write")["scalar_write"]
     assert [listed[key] for key in keys] == [dict(tag, version=2) if explicit_tags else tag for tag in tags]
