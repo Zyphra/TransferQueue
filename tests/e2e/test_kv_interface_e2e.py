@@ -28,9 +28,10 @@ import pytest
 import ray
 import torch
 from omegaconf import OmegaConf
-from tensordict import TensorDict
+from tensordict import NonTensorStack, TensorDict
 
 import transfer_queue as tq
+from transfer_queue.utils.zmq_utils import ZMQRequestType
 
 
 class TQAPIWrapper:
@@ -194,6 +195,14 @@ def assert_tensor_equal(tensor_a, tensor_b, msg=""):
             assert torch.equal(t1, t2), f"{msg} Tensors are not equal: {tensor_a} vs {tensor_b}"
     else:
         assert torch.equal(tensor_a, tensor_b), f"{msg} Tensors are not equal: {tensor_a} vs {tensor_b}"
+
+
+def assert_tensor_bytes_equal(actual, expected):
+    """Compare dense or jagged rows without losing signed-zero evidence."""
+    assert actual.dtype == expected.dtype
+    for observed, reference in zip(actual.unbind(), expected.unbind(), strict=True):
+        assert observed.shape == reference.shape
+        assert torch.equal(observed.contiguous().view(torch.uint8), reference.contiguous().view(torch.uint8))
 
 
 def assert_tensor_close(tensor_a, tensor_b, rtol=1e-5, atol=1e-8, msg=""):
@@ -1192,6 +1201,185 @@ def test_failed_field_write_does_not_publish_tags(controller, tq_api, monkeypatc
         )
     assert tq_api.kv_list(partition_id=partition_id)[partition_id][keys[0]]["version"] == 1
     assert "failed" not in client.kv_retrieve_meta(keys=keys, partition_id=partition_id, create=False).field_names
+
+
+def test_get_projects_metadata_before_controller_response(controller, tq_api, monkeypatch, record_property):
+    keys = [f"projection_{i}" for i in range(4)]
+    tags = [{"uid": key, "counters": {f"measure_{i}": i for i in range(1000)}} for key in keys]
+    scalars = torch.tensor([[0.0, -0.0], [1.0, 2.0], [-3.0, 4.0], [5.0, 6.0]], dtype=torch.float32)
+    data = TensorDict({"scalar": scalars, "unused": torch.ones(4, 32)}, batch_size=4)
+    tq_api.kv_batch_put(keys=keys, partition_id="projected", fields=data, tags=tags)
+    client = tq.get_client()
+    full = client.kv_retrieve_meta(keys=keys, partition_id="projected")
+    responses = []
+    request = client._request_controller
+
+    async def record_request(**kwargs):
+        response = await request(**kwargs)
+        if kwargs["request_type"] == ZMQRequestType.KV_RETRIEVE_META:
+            responses.append((kwargs["body"], response))
+        return response
+
+    monkeypatch.setattr(client, "_request_controller", record_request)
+    actual = tq_api.kv_batch_get(keys=list(reversed(keys)), partition_id="projected", select_fields="scalar")
+    assert_tensor_bytes_equal(actual["scalar"], scalars.flip(0))
+    body, response = responses.pop()
+    projected = response.body["metadata"]
+    assert body["data_fields"] == ["scalar"] and body["include_custom_meta"] is False
+    assert projected.field_names == ["scalar"] and projected.custom_meta == [{} for _ in keys]
+    assert projected.global_indexes == list(reversed(full.global_indexes))
+    from transfer_queue.utils.serial_utils import encode
+
+    full_bytes = sum(memoryview(frame).nbytes for frame in encode(full))
+    projected_bytes = sum(memoryview(frame).nbytes for frame in encode(projected))
+    record_property("reserialized_full_metadata_bytes", full_bytes)
+    record_property("reserialized_projected_metadata_bytes", projected_bytes)
+    assert projected_bytes < full_bytes // 10
+    assert tq_api.kv_list(partition_id="projected")["projected"] == dict(zip(keys, tags, strict=True))
+
+
+def test_get_projection_preserves_older_controller_selection(controller, tq_api, monkeypatch):
+    keys = ["old_controller_0", "old_controller_1"]
+    scalars = torch.tensor([[0.0, -0.0], [-1.0, 2.0]], dtype=torch.float32)
+    tq_api.kv_batch_put(
+        keys=keys,
+        partition_id="old_controller",
+        fields=TensorDict({"scalar": scalars, "unused": torch.ones(2, 8)}, batch_size=2),
+    )
+    client = tq.get_client()
+    request = client._request_controller
+
+    async def older_controller_request(**kwargs):
+        if kwargs["request_type"] == ZMQRequestType.KV_RETRIEVE_META:
+            kwargs["body"] = {name: kwargs["body"][name] for name in ("keys", "partition_id", "create")}
+        return await request(**kwargs)
+
+    monkeypatch.setattr(client, "_request_controller", older_controller_request)
+    actual = tq_api.kv_batch_get(keys=keys, partition_id="old_controller", select_fields="scalar")
+    assert set(actual.keys()) == {"scalar"}
+    assert_tensor_bytes_equal(actual["scalar"], scalars)
+
+
+@pytest.mark.parametrize("selected", [["ready"], ["partial"], ["missing"], [], None])
+def test_projected_metadata_matches_legacy_selection(controller, tq_api, selected):
+    keys = ["row0", "row1"]
+    tq_api.kv_batch_put(
+        keys=keys,
+        partition_id="selection",
+        fields=TensorDict({"ready": torch.ones(2, 1)}, batch_size=2),
+        tags=[{"uid": key} for key in keys],
+    )
+    tq_api.kv_put(key=keys[0], partition_id="selection", fields={"partial": torch.ones(3)})
+    client = tq.get_client()
+    legacy = client.kv_retrieve_meta(keys=keys, partition_id="selection")
+    if selected is not None:
+        legacy = legacy.select_fields(selected)
+    projected = client.kv_retrieve_meta(
+        keys=keys,
+        partition_id="selection",
+        data_fields=selected,
+        include_custom_meta=False,
+    )
+    assert projected.field_schema == legacy.field_schema
+    assert projected.global_indexes == legacy.global_indexes
+    assert projected.partition_ids == legacy.partition_ids
+    assert projected.production_status.tolist() == legacy.production_status.tolist()
+    assert projected.is_ready == legacy.is_ready
+    assert projected._custom_backend_meta == legacy._custom_backend_meta
+    assert projected.custom_meta == [{}, {}]
+
+
+@pytest.mark.parametrize("explicit_tags", [False, True])
+def test_write_projects_schemas_preserving_values_tags_and_readiness(controller, tq_api, monkeypatch, explicit_tags):
+    keys = ["scalar_0", "scalar_1"]
+    tags = [{"uid": key, "version": 1} for key in keys]
+    tq_api.kv_batch_put(
+        keys=keys,
+        partition_id="scalar_write",
+        tags=tags,
+        fields=TensorDict({"old": torch.ones(2, 8)}, batch_size=2),
+    )
+    client = tq.get_client()
+    responses = []
+    request = client._request_controller
+
+    async def record_request(**kwargs):
+        response = await request(**kwargs)
+        if kwargs["request_type"] == ZMQRequestType.KV_RETRIEVE_META:
+            responses.append((kwargs["body"], response.body["metadata"].copy()))
+        return response
+
+    monkeypatch.setattr(client, "_request_controller", record_request)
+    scalars = torch.tensor([[0.0, -0.0], [-0.5, 2.0]], dtype=torch.float32)
+    result = tq_api.kv_batch_put(
+        keys=keys,
+        partition_id="scalar_write",
+        fields=TensorDict({"scalar": scalars}, batch_size=2),
+        tags=[{"version": 2} for _ in keys] if explicit_tags else None,
+    )
+    assert result.fields == ["old", "scalar"]
+    assert result.tags == [dict(tag, version=2) if explicit_tags else tag for tag in tags]
+    body, metadata = responses.pop()
+    assert body["data_fields"] is None and body["include_custom_meta"] is True
+    assert body["include_field_schema"] is False
+    assert metadata.field_schema == {"old": {}} and metadata._custom_backend_meta == [{}, {}]
+    assert metadata.custom_meta == tags
+    actual = tq_api.kv_batch_get(keys=keys, partition_id="scalar_write")
+    assert_tensor_bytes_equal(actual["scalar"], scalars)
+    assert_tensor_equal(actual["old"], torch.ones(2, 8))
+    listed = tq_api.kv_list(partition_id="scalar_write")["scalar_write"]
+    assert [listed[key] for key in keys] == [dict(tag, version=2) if explicit_tags else tag for tag in tags]
+
+
+def test_projected_write_creates_keys_and_keeps_default_receipt(controller, tq_api):
+    data = TensorDict({"scalar": torch.tensor([[1.0, 2.0]])}, batch_size=1)
+    created = tq_api.kv_batch_put(keys=["new"], partition_id="new", fields=data)
+    assert created.keys == ["new"] and created.fields == ["scalar"] and created.tags == [{}]
+    assert_tensor_equal(tq_api.kv_batch_get(keys="new", partition_id="new")["scalar"], data["scalar"])
+    receipt = tq_api.kv_batch_put(keys=["new"], partition_id="new", tags=[{"version": 2}])
+    assert receipt.keys == ["new"] and receipt.tags == [{"version": 2}] and receipt.fields == ["scalar"]
+
+
+def test_get_projection_preserves_jagged_and_non_tensor_rows(controller, tq_api, backend_name):
+    keys = ["jagged_0", "jagged_1", "jagged_2"]
+    # Mooncake's buffer API rejects null pointers for zero-byte tensors.
+    sizes = (1, 2, 5) if backend_name == "MooncakeStore" else (0, 2, 5)
+    rows = [torch.arange(size, dtype=torch.int64) for size in sizes]
+    contexts = [{"uid": key, "offset": index} for index, key in enumerate(keys)]
+    fields = TensorDict(
+        {
+            "tokens": torch.nested.as_nested_tensor(rows, layout=torch.jagged),
+            "context": NonTensorStack(*contexts),
+            "unused": torch.ones(3, 2),
+        },
+        batch_size=3,
+    )
+    tq_api.kv_batch_put(keys=keys, partition_id="jagged_projection", fields=fields)
+    actual = tq_api.kv_batch_get(
+        keys=list(reversed(keys)),
+        partition_id="jagged_projection",
+        select_fields=["tokens", "context"],
+    )
+    assert set(actual.keys()) == {"tokens", "context"}
+    for observed, expected in zip(actual["tokens"].unbind(), reversed(rows), strict=True):
+        assert observed.dtype == expected.dtype and observed.shape == expected.shape
+        assert torch.equal(observed, expected)
+    assert [getattr(value, "data", value) for value in actual["context"]] == list(reversed(contexts))
+
+
+def test_projected_get_keeps_tag_only_rows_unready(controller, tq_api):
+    tq_api.kv_batch_put(keys=["pending"], partition_id="pending", tags=[{"status": "pending"}])
+    client = tq.get_client()
+    original = client.kv_retrieve_meta(keys=["pending"], partition_id="pending")
+    projected = client.kv_retrieve_meta(
+        keys=["pending"],
+        partition_id="pending",
+        data_fields=["missing"],
+        include_custom_meta=False,
+    )
+    assert not original.is_ready and not projected.is_ready
+    with pytest.raises(ValueError, match="not ready"):
+        tq_api.kv_batch_get(keys=["pending"], partition_id="pending", select_fields=["missing"])
 
 
 class TestKVE2ECornerCases:

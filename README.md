@@ -121,6 +121,16 @@ To simplify the usage of TransferQueue, we provide a Redis-style high-level API 
 - **(async_)kv_list**: List keys and tags (metadata) in a partition.
 - **(async_)kv_clear**: Remove key-value pairs from storage.
 
+Column-selected GETs project field schemas in the controller and omit user tags
+from their internal metadata response; returned field values and key order are
+unchanged. The low-level metadata API still includes all ready fields and tags
+unless a projection is requested explicitly.
+
+Batch writes fetch existing field names and tags without per-row tensor shapes
+or backend locators: storage writes derive their schema from the actual values.
+The returned `KVBatchMeta` still includes all existing fields and the same tag
+snapshot. Explicit tag updates retain their merge/publication behavior.
+
 **Key Features**
 
 - **Redis-style Semantics**: Familiar KV interface (Put/Get/List) for a zero learning curve.

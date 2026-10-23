@@ -913,6 +913,10 @@ class AsyncTransferQueueClient:
         partition_id: str,
         create: bool = False,
         socket: zmq.asyncio.Socket | None = None,
+        *,
+        data_fields: list[str] | None = None,
+        include_custom_meta: bool = True,
+        include_field_schema: bool = True,
     ) -> BatchMeta:
         """Asynchronously retrieve BatchMeta by user-defined keys.
 
@@ -924,6 +928,9 @@ class AsyncTransferQueueClient:
             partition_id: The ID of the logical partition to search for keys.
             create:  If True, automatically create entries for missing keys.
             socket: ZMQ socket injected by @with_controller_socket.
+            data_fields: Optional field projection performed by the controller.
+            include_custom_meta: Include per-key user tags in the response.
+            include_field_schema: Include per-field shapes and backend locators.
 
         Returns:
             BatchMeta: Metadata for the requested keys.
@@ -948,6 +955,9 @@ class AsyncTransferQueueClient:
                     "keys": keys,
                     "partition_id": partition_id,
                     "create": create,
+                    "data_fields": data_fields,
+                    "include_custom_meta": include_custom_meta,
+                    "include_field_schema": include_field_schema,
                 },
             )
             return response_msg.body.get("metadata", BatchMeta.empty())
@@ -1650,6 +1660,10 @@ class TransferQueueClient(AsyncTransferQueueClient):
         keys: list[str] | str,
         partition_id: str,
         create: bool = False,
+        *,
+        data_fields: list[str] | None = None,
+        include_custom_meta: bool = True,
+        include_field_schema: bool = True,
     ) -> BatchMeta:
         """Synchronously retrieve BatchMeta by user-defined keys.
 
@@ -1660,6 +1674,9 @@ class TransferQueueClient(AsyncTransferQueueClient):
             keys: List of keys to retrieve from the controller.
             partition_id: Logical partition to query.
             create: If True, automatically create entries for non-existent keys.
+            data_fields: Optional field projection performed by the controller.
+            include_custom_meta: Include per-key user tags in the response.
+            include_field_schema: Include per-field shapes and backend locators.
 
         Returns:
             BatchMeta: Metadata for the requested keys.
@@ -1667,7 +1684,14 @@ class TransferQueueClient(AsyncTransferQueueClient):
         Raises:
             TypeError: If `keys` is not a list of string or a string
         """
-        return self._kv_retrieve_meta(keys=keys, partition_id=partition_id, create=create)
+        return self._kv_retrieve_meta(
+            keys=keys,
+            partition_id=partition_id,
+            create=create,
+            data_fields=data_fields,
+            include_custom_meta=include_custom_meta,
+            include_field_schema=include_field_schema,
+        )
 
     def kv_retrieve_keys(
         self,

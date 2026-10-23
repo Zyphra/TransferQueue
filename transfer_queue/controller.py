@@ -1379,6 +1379,8 @@ class TransferQueueController:
         batch_global_indexes: list[int],
         data_fields: list[str],
         mode: str = "fetch",
+        include_custom_meta: bool = True,
+        include_field_schema: bool = True,
     ) -> BatchMeta:
         """
         Generate BatchMeta for specific samples in a partition.
@@ -1409,7 +1411,11 @@ class TransferQueueController:
 
         batch_size = len(batch_global_indexes)
 
-        field_schema = partition.get_field_schema(data_fields, batch_global_indexes)
+        field_schema = (
+            partition.get_field_schema(data_fields, batch_global_indexes)
+            if include_field_schema
+            else {name: {} for name in data_fields}
+        )
 
         # In insert mode, create placeholder schema for unregistered fields so that
         # metadata.field_names is complete and update_production_status() can recognize them.
@@ -1449,8 +1455,10 @@ class TransferQueueController:
                         )
                         production_status[in_range] = ready
 
-        custom_meta_dict = partition.get_custom_meta(batch_global_indexes)
-        custom_backend_meta = partition.get_field_custom_backend_meta(batch_global_indexes, data_fields)
+        custom_meta_dict = partition.get_custom_meta(batch_global_indexes) if include_custom_meta else {}
+        custom_backend_meta = (
+            partition.get_field_custom_backend_meta(batch_global_indexes, data_fields) if include_field_schema else {}
+        )
 
         # Convert controller dict[int, dict] → BatchMeta list[dict] (aligned with batch_global_indexes)
         custom_meta_list = [custom_meta_dict.get(global_index, {}) for global_index in batch_global_indexes]
@@ -1614,6 +1622,9 @@ class TransferQueueController:
         keys: list[str],
         partition_id: str,
         create: bool = False,
+        data_fields: list[str] | None = None,
+        include_custom_meta: bool = True,
+        include_field_schema: bool = True,
     ) -> BatchMeta:
         """
         Retrieve BatchMeta from the controller using a list of keys.
@@ -1623,6 +1634,10 @@ class TransferQueueController:
             keys: List of keys to retrieve from the controller
             partition_id: Partition id to retrieve from the controller
             create: Whether to register new keys if not found.
+            data_fields: Optional field projection, applied before schema generation.
+            include_custom_meta: Include per-key user tags in the response.
+            include_field_schema: Include per-field shapes and backend locators;
+                writes need only the existing field names.
 
         Returns:
             metadata: BatchMeta of the requested keys
@@ -1679,12 +1694,26 @@ class TransferQueueController:
         col_mask = partition.production_status[verified_global_indexes, :].sum(dim=0).reshape(-1) == len(
             verified_global_indexes
         )
-        data_fields = []
+        ready_fields = []
         for field_name, col_idx in partition.field_name_mapping.items():
             if col_idx < len(col_mask) and col_mask[col_idx]:
-                data_fields.append(field_name)
+                ready_fields.append(field_name)
 
-        return self.generate_batch_meta(partition_id, verified_global_indexes, data_fields, mode="force_fetch")
+        if data_fields is None:
+            data_fields = ready_fields
+        else:
+            data_fields = [name for name in data_fields if name in ready_fields]
+        # Keep the readiness of the original full-metadata lookup even when
+        # projection selects no fields; client-side selection retained it too.
+        mode = "fetch" if ready_fields else "force_fetch"
+        return self.generate_batch_meta(
+            partition_id,
+            verified_global_indexes,
+            data_fields,
+            mode=mode,
+            include_custom_meta=include_custom_meta,
+            include_field_schema=include_field_schema,
+        )
 
     def kv_retrieve_keys(
         self,
@@ -2124,6 +2153,9 @@ class TransferQueueController:
             keys=params["keys"],
             partition_id=params["partition_id"],
             create=params["create"],
+            data_fields=params.get("data_fields"),
+            include_custom_meta=params.get("include_custom_meta", True),
+            include_field_schema=params.get("include_field_schema", True),
         )
         return self._make_response(
             request_msg,

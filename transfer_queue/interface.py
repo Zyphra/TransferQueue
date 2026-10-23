@@ -758,7 +758,12 @@ async def async_kv_batch_put(
     tq_client = _maybe_create_tq_client()
 
     # 1. translate user-specified key to BatchMeta
-    batch_meta = await tq_client.async_kv_retrieve_meta(keys=keys, partition_id=partition_id, create=True)
+    batch_meta = await tq_client.async_kv_retrieve_meta(
+        keys=keys,
+        partition_id=partition_id,
+        create=True,
+        include_field_schema=False,
+    )
 
     if batch_meta.size != len(keys):
         raise RuntimeError(
@@ -883,16 +888,16 @@ async def async_kv_batch_get(
     """
     tq_client = _maybe_create_tq_client()
 
-    batch_meta = await tq_client.async_kv_retrieve_meta(keys=keys, partition_id=partition_id, create=False)
+    fields_to_fetch = [select_fields] if isinstance(select_fields, str) else select_fields
+    batch_meta = await tq_client.async_kv_retrieve_meta(
+        keys=keys, partition_id=partition_id, create=False, data_fields=fields_to_fetch, include_custom_meta=False
+    )
 
     if batch_meta.size == 0:
         raise ValueError("keys or partition were not found!")
 
-    if select_fields is not None:
-        if isinstance(select_fields, str):
-            fields_to_fetch = [select_fields]
-        else:
-            fields_to_fetch = select_fields
+    # Older controllers ignore the projection parameters in the request.
+    if fields_to_fetch is not None and set(batch_meta.field_names) - set(fields_to_fetch):
         batch_meta = batch_meta.select_fields(fields_to_fetch)
 
     if not batch_meta.is_ready:
