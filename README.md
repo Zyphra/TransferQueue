@@ -17,6 +17,10 @@
 
 <h2 id="overview">🎉 Overview</h2>
 
+Checkpoint storage failures can cross Ray process boundaries without transferring
+their local writer Future. See [checkpoint error ownership](docs/checkpoint.md#tqsave_checkpoint)
+for the settlement and retirement contract.
+
 TransferQueue is a high-performance data storage and transfer module with panoramic data visibility and streaming scheduling capabilities, optimized for efficient dataflow in post-training workflows.
 
 <p align="center">

@@ -1004,6 +1004,10 @@ class CheckpointStorageError(RuntimeError):
         self.timed_out = timed_out
         self.checkpoint_future = None
 
+    def __reduce__(self):
+        # Writer ownership stays local; the failure can cross process boundaries.
+        return type(self), self.args, {**self.__dict__, "checkpoint_future": None}
+
 
 class CheckpointStorageTimeoutError(CheckpointStorageError, TimeoutError):
     """A storage deadline does not attest that its writers have settled."""
