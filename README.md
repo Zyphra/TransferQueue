@@ -425,8 +425,16 @@ input, loads a model, or removes checkpoint state. It preserves exact CPU tensor
 bytes/dtypes for token IDs, masks and stored rewards, plus a bounded light-signal
 allowlist. Missing native rewards remain explicitly absent; empty responses stay
 empty. Routed experts, log-probabilities, full batches and grader payloads are
-omitted. Unsupported tensor layouts, non-JSON identity/signals and inconsistent
-lengths fail rather than being silently converted.
+omitted. Light metadata retains producer identity, episode termination enums,
+scalar disposition/error fields and every gate's observed/would-veto/applied
+flags, rewards, reasons and numeric metrics. Full per-turn gate traces and
+unknown nested grader/evidence fields are omitted explicitly: each row reports
+signals._omitted, and the manifest/independent verifier compare aggregated
+omitted_signal_items. Trace completeness flags and the original turn count
+remain; individual turn evidence is not backed up. Required scalar/reason fields
+are never truncated or coerced. The combined 16 KiB light-signal bound remains;
+overflow reports field byte counts without values. Unsupported tensor layouts,
+non-JSON identity/signals and inconsistent lengths fail.
 
 First produce a controller plan, binding its original storage-unit manifest:
 

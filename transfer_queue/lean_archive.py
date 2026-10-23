@@ -19,6 +19,10 @@ PLAN_SCHEMA = "transfer_queue.lean_plan.v1"
 RECORD_SCHEMA = "transfer_queue.lean_trajectory.v1"
 LIGHT_KEYS = (
     "status",
+    "uid",
+    "session_id",
+    "gym_episode_id",
+    "rollout_attempt",
     "data_source",
     "task_id",
     "global_steps",
@@ -37,6 +41,13 @@ LIGHT_KEYS = (
 MASK_FIELDS = ("response_mask", "loss_mask", "attention_mask", "generated_response_mask")
 EPISODE_LIGHT_KEYS = (
     "done_reason",
+    "subtype",
+    "data_source",
+    "task_family",
+    "evidence_gaps",
+    "tool_calls_ok",
+    "tool_calls_error",
+    "tool_calls_rejected",
     "generated_tokens",
     "prompt_tokens_end",
     "turns",
@@ -105,14 +116,163 @@ def load_pickle(path, max_bytes, expected_sha256=None):
     return value, {"path": str(path.absolute()), **file_identity(before), "sha256": digest}
 
 
-def light_values(values):
-    selected = {key: values[key] for key in LIGHT_KEYS if key in values}
-    episode = values.get("episode_metrics")
-    if isinstance(episode, dict):
-        selected["episode_metrics"] = {key: episode[key] for key in EPISODE_LIGHT_KEYS if key in episode}
-    if len(canonical(selected)) > 16384:
-        raise ValueError("selected light signals exceed 16 KiB; review the source contract")
+# These are producer decision summaries, not arbitrary grader/evidence mappings.
+GATE_KEYS = ("gate", "observed", "would_veto", "applied", "reasons", "reward_before", "reward_after")
+TRACE_KEYS = ("evidence_present", "evidence_complete", "would_veto", "applied", "reasons", "monitor_reasons")
+ERROR_KEYS = (
+    "source",
+    "stage",
+    "cause",
+    "exception_class",
+    "error_class",
+    "error_is_timeout",
+    "error_reason",
+    "http_status",
+    "errno",
+    "server_role",
+    "source_sha256",
+    "judge_attempt",
+    "transport_attempt",
+    "native_error_kind",
+    "native_error_type",
+    "native_return_code",
+    "timeout_s",
+    "evaluated",
+)
+DISPOSITION_KEYS = ("schema", "scope", "mask", "replay", "actor_update", "events", "episode_return")
+FLAG_KEYS = frozenset(
+    (
+        "is_loss_masked",
+        "scored",
+        "masked",
+        "zero",
+        "observed",
+        "would_veto",
+        "applied",
+        "evidence_present",
+        "evidence_complete",
+        "error_is_timeout",
+        "evaluated",
+    )
+)
+DUMP_KEYS = ("grader_components", "verifier_verdict", "reward_extra_info", "reward_gate_turns", "full_batch")
+
+
+def _scalar_fields(values, keys, path, omitted, nested=()):
+    if not isinstance(values, dict):
+        raise ValueError(f"{path} must be a producer mapping")
+    unknown = values.keys() - set(keys) - set(nested)
+    if unknown:
+        omitted[path] += len(unknown)
+    selected = {}
+    for key in keys:
+        if key not in values:
+            continue
+        value = values[key]
+        if key in FLAG_KEYS and value is not None and type(value) is not bool:
+            raise ValueError(f"{path}.{key} must be a boolean or explicit null")
+        if key in ("reasons", "monitor_reasons", "evidence_gaps"):
+            if not isinstance(value, list) or any(type(item) is not str for item in value):
+                raise ValueError(f"{path}.{key} must contain reason strings")
+        elif value is not None and type(value) not in (bool, int, float, str):
+            raise ValueError(f"{path}.{key} must be a scalar or explicit null")
+        selected[key] = value
     return selected
+
+
+def _gate_signals(value, omitted):
+    if value is None:
+        return None
+    path = "reward_gate_decisions"
+    result = _scalar_fields(
+        value, ("schema", "policy", "native_reward", "final_reward"), path, omitted, nested=("decisions", "trace")
+    )
+    if "decisions" in value:
+        if not isinstance(value["decisions"], list):
+            raise ValueError("reward gate decisions must be a list")
+        result["decisions"] = []
+        for decision in value["decisions"]:
+            item = _scalar_fields(decision, GATE_KEYS, path + ".decisions", omitted, nested=("metrics",))
+            if "metrics" in decision:
+                metrics = decision["metrics"]
+                if not isinstance(metrics, dict) or any(type(v) not in (int, float) for v in metrics.values()):
+                    raise ValueError("reward gate metrics must be numeric scalars")
+                item["metrics"] = metrics.copy()
+            result["decisions"].append(item)
+    if "trace" in value:
+        trace = value["trace"]
+        result["trace"] = _scalar_fields(trace, TRACE_KEYS, path + ".trace", omitted, nested=("turns", "turn_count"))
+        if "turns" in trace:
+            if not isinstance(trace["turns"], list):
+                raise ValueError("reward gate trace turns must be a list")
+            result["trace"]["turn_count"] = len(trace["turns"])
+            if trace["turns"]:
+                omitted[path + ".trace.turns"] += len(trace["turns"])
+        elif "turn_count" in trace:
+            if type(trace["turn_count"]) is not int or trace["turn_count"] < 0:
+                raise ValueError("projected reward gate turn count must be a nonnegative integer")
+            result["trace"]["turn_count"] = trace["turn_count"]
+    return result
+
+
+def _verification_signals(value, omitted):
+    if value is None or isinstance(value, str):
+        return value
+    components = ("original_failure", "verification_failure_after_policy_zero", "verification_failure_after_trace_veto")
+    result = _scalar_fields(value, ("schema",), "verification_disposition", omitted, nested=(*components, "trace_veto"))
+    for key in components:
+        if key in value:
+            result[key] = (
+                None
+                if value[key] is None
+                else _scalar_fields(value[key], ERROR_KEYS, "verification_disposition." + key, omitted)
+            )
+    if "trace_veto" in value:
+        result["trace_veto"] = (
+            None
+            if value["trace_veto"] is None
+            else _scalar_fields(value["trace_veto"], TRACE_KEYS, "verification_disposition.trace_veto", omitted)
+        )
+    return result
+
+
+def _bounded_signals(selected):
+    if len(canonical(selected)) > 16384:
+        sizes = {key: len(canonical(value)) for key, value in selected.items()}
+        raise ValueError(f"selected light signals exceed 16 KiB; projected field bytes: {sizes}")
+    return selected
+
+
+def light_values(values):
+    nested = ("verification_disposition", "training_disposition", "reward_gate_decisions")
+    omitted = Counter()
+    root = {key: values[key] for key in LIGHT_KEYS if key in values}
+    selected = _scalar_fields(
+        root, tuple(key for key in LIGHT_KEYS if key not in nested), "signals", omitted, nested=nested
+    )
+    if "episode_metrics" in values:
+        selected["episode_metrics"] = (
+            None
+            if values["episode_metrics"] is None
+            else _scalar_fields(values["episode_metrics"], EPISODE_LIGHT_KEYS, "episode_metrics", omitted)
+        )
+    if "reward_gate_decisions" in values:
+        selected["reward_gate_decisions"] = _gate_signals(values["reward_gate_decisions"], omitted)
+    if "verification_disposition" in values:
+        selected["verification_disposition"] = _verification_signals(values["verification_disposition"], omitted)
+    if "training_disposition" in values:
+        value = values["training_disposition"]
+        selected["training_disposition"] = (
+            value
+            if value is None or isinstance(value, str)
+            else _scalar_fields(value, DISPOSITION_KEYS, "training_disposition", omitted)
+        )
+    for key in DUMP_KEYS:
+        if key in values:
+            omitted[key] += 1
+    if omitted:
+        selected["_omitted"] = dict(omitted)
+    return _bounded_signals(selected)
 
 
 def completion_plan(state, units, completed_tag, completed_value, partition_id):
@@ -304,9 +464,17 @@ def project_row(fields, planned):
         if not planned["key"].startswith(prefix):
             raise ValueError("stored session identity differs from the controller key")
     extra = get("extra_fields")
-    signals = dict(planned["signals"])
+    planned_signals = dict(planned["signals"])
+    omitted = Counter(planned_signals.pop("_omitted", {}))
+    signals = light_values(planned_signals)
+    omitted.update(signals.pop("_omitted", {}))
     if isinstance(extra, dict):
-        signals.update(light_values(extra))
+        projected = light_values(extra)
+        omitted.update(projected.pop("_omitted", {}))
+        signals.update(projected)
+    if omitted:
+        signals["_omitted"] = dict(omitted)
+    _bounded_signals(signals)
     return {
         "schema": RECORD_SCHEMA,
         "key": planned["key"],
@@ -333,8 +501,11 @@ def extract_unit(state, plan, position, stream):
     if any(index % plan["units"] != position for values in fields.values() for index in values):
         raise ValueError("storage unit contains rows assigned to another unit position")
     keys_digest, records_digest = hashlib.sha256(), hashlib.sha256()
+    omitted = Counter()
     for row in selected:
-        record = canonical(project_row(fields, row)) + b"\n"
+        projected = project_row(fields, row)
+        omitted.update(projected["signals"].get("_omitted", {}))
+        record = canonical(projected) + b"\n"
         stream.write(record)
         keys_digest.update(canonical(row["key"]) + b"\n")
         records_digest.update(record)
@@ -345,6 +516,8 @@ def extract_unit(state, plan, position, stream):
         "unit_position": position,
         "storage_unit_id": state.get("storage_unit_id"),
         "all_expected_unit_rows_exported": True,
+        "light_signal_projection": "producer_scalars_without_grader_or_turn_evidence_v1",
+        "omitted_signal_items": dict(omitted),
     }
 
 
@@ -421,6 +594,7 @@ def verify_archive(archive, plan, plan_sha256, manifest_sha256, max_bytes, max_r
     if manifest["completed_rows"] != len(expected):
         raise ValueError("manifest row count differs from plan")
     keys, records, count_bytes = hashlib.sha256(), hashlib.sha256(), 0
+    omitted = Counter()
     path = archive / "completed.jsonl.gz"
     before = path.lstat()
     if not stat.S_ISREG(before.st_mode) or before.st_size != manifest["output_bytes"]:
@@ -442,6 +616,12 @@ def verify_archive(archive, plan, plan_sha256, manifest_sha256, max_bytes, max_r
                     or record["global_index"] != row["global_index"]
                 ):
                     raise ValueError("decompressed row identity differs from plan")
+                row_omissions = record.get("signals", {}).get("_omitted", {})
+                if not isinstance(row_omissions, dict) or any(
+                    type(key) is not str or type(value) is not int or value <= 0 for key, value in row_omissions.items()
+                ):
+                    raise ValueError("invalid light-signal omission accounting")
+                omitted.update(row_omissions)
                 keys.update(canonical(record["key"]) + b"\n")
                 records.update(line)
             if zipped.read(1):
@@ -455,12 +635,14 @@ def verify_archive(archive, plan, plan_sha256, manifest_sha256, max_bytes, max_r
         digest != manifest["output_sha256"]
         or keys.hexdigest() != manifest["keys_sha256"]
         or records.hexdigest() != manifest["uncompressed_records_sha256"]
+        or dict(omitted) != manifest.get("omitted_signal_items", {})
     ):
         raise ValueError("archive compressed/key/uncompressed-record digest mismatch")
     return {
         "status": "PASS_ARCHIVE_BYTES_AND_PLANNED_ROWS",
         "unit_position": position,
         "verified_rows": len(expected),
+        "omitted_signal_items": dict(omitted),
         "uncompressed_bytes": count_bytes,
         "output_sha256": digest,
         "keys_sha256": keys.hexdigest(),
@@ -574,6 +756,8 @@ def main(argv=None):
                 "routed_experts",
                 "full_metrics",
                 "full_batch",
+                "grader_evidence",
+                "reward_gate_turn_records",
                 "log_probs",
                 "model_optimizer_RNG_loader_queue_state",
             ],

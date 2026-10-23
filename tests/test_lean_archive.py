@@ -409,3 +409,185 @@ def test_verify_refuses_corrupt_truncated_or_misbound_archives(extracted_archive
     with pytest.raises((ValueError, OSError, EOFError)):
         main(argv)
     assert not output.exists()
+
+
+@pytest.fixture
+def heavy_native_signals():
+    turn = {
+        "turn": 1,
+        "sampled_tokens": 64,
+        "presented_empty": False,
+        "valid_completion": True,
+        "malformed_tool_call": False,
+        "declared_tool_protocol": False,
+        "protocol_only": False,
+        "gibberish": False,
+        "repetition": False,
+        "tool_in_reasoning": False,
+    }
+    return {
+        "gym_episode_id": "native-episode",
+        "uid": "prompt",
+        "session_id": 0,
+        "is_loss_masked": False,
+        "reward_status": "scored",
+        "episode_metrics": {
+            "done_reason": "task_stop",
+            "termination_evidence": "explicit",
+            "scored": True,
+            "masked": False,
+            "zero": False,
+            "reward": 0.75,
+            "grader_payload": {"full_text": "not-light" * 100000},
+        },
+        "reward_gate_decisions": {
+            "schema": "verl_wrapper.reward_gate_decisions.v1",
+            "policy": "high_confidence_v1",
+            "native_reward": 0.75,
+            "final_reward": 0.0,
+            "decisions": [
+                {
+                    "gate": "trace",
+                    "observed": True,
+                    "would_veto": True,
+                    "applied": False,
+                    "reasons": ["gibberish"],
+                    "reward_before": 0.75,
+                    "reward_after": 0.0,
+                    "metrics": {"threshold": 0.04},
+                    "grader_dump": "not-light" * 100000,
+                }
+            ],
+            "trace": {
+                "evidence_present": True,
+                "evidence_complete": True,
+                "reasons": ["gibberish"],
+                "monitor_reasons": ["tool_in_reasoning"],
+                "turns": [dict(turn, turn=i + 1) for i in range(2000)],
+                "grader_dump": "not-light" * 100000,
+            },
+        },
+        "verification_disposition": {
+            "schema": "verl_wrapper.verification_disposition.v1",
+            "original_failure": {
+                "stage": "verification",
+                "error_is_timeout": True,
+                "http_status": 504,
+                "message": "not-light" * 100000,
+            },
+            "verification_failure_after_policy_zero": None,
+            "trace_veto": {
+                "would_veto": True,
+                "applied": False,
+                "evidence_present": True,
+                "reasons": ["gibberish"],
+                "raw_evidence": "not-light" * 100000,
+            },
+        },
+        "training_disposition": {
+            "scope": "completion_before_replay_filtering",
+            "mask": "retained",
+            "replay": "unknown_at_completion",
+            "actor_update": "unknown_at_completion",
+            "events": "training_dispositions",
+            "episode_return": "returned",
+            "grader_dump": "not-light" * 100000,
+        },
+    }
+
+
+def test_heavy_native_evidence_keeps_all_scalar_decisions_and_reports_omissions(row, fields, heavy_native_signals):
+    fields["extra_fields"][0] = heavy_native_signals
+    record = project_row(fields, row)
+    signals = record["signals"]
+    assert len(json.dumps(signals).encode()) < 16384
+    assert "not-light" not in json.dumps(record)
+    assert signals["gym_episode_id"] == "native-episode"
+    assert signals["episode_metrics"]["termination_evidence"] == "explicit"
+    assert signals["episode_metrics"]["masked"] is False
+    gate = signals["reward_gate_decisions"]
+    assert gate["native_reward"] == 0.75 and gate["final_reward"] == 0.0
+    assert gate["decisions"][0] == {
+        "gate": "trace",
+        "observed": True,
+        "would_veto": True,
+        "applied": False,
+        "reasons": ["gibberish"],
+        "reward_before": 0.75,
+        "reward_after": 0.0,
+        "metrics": {"threshold": 0.04},
+    }
+    assert gate["trace"]["turn_count"] == 2000 and gate["trace"]["evidence_complete"] is True
+    assert signals["_omitted"]["reward_gate_decisions.trace.turns"] == 2000
+    assert signals["verification_disposition"]["original_failure"] == {
+        "stage": "verification",
+        "error_is_timeout": True,
+        "http_status": 504,
+    }
+    assert signals["training_disposition"]["actor_update"] == "unknown_at_completion"
+
+
+@pytest.mark.parametrize("change", ["flag", "reason", "metric", "termination", "oversize_identity"])
+def test_required_light_signals_are_never_coerced_or_truncated(row, fields, heavy_native_signals, change):
+    fields["extra_fields"][0] = heavy_native_signals
+    if change == "flag":
+        heavy_native_signals["reward_gate_decisions"]["decisions"][0]["applied"] = "false"
+    elif change == "reason":
+        heavy_native_signals["reward_gate_decisions"]["trace"]["reasons"] = [False]
+    elif change == "metric":
+        heavy_native_signals["reward_gate_decisions"]["decisions"][0]["metrics"] = {"x": float("nan")}
+    elif change == "termination":
+        heavy_native_signals["episode_metrics"]["termination_evidence"] = {"grader_dump": "large"}
+    else:
+        heavy_native_signals["gym_episode_id"] = "required-identity" * 2000
+    with pytest.raises(ValueError) as caught:
+        project_row(fields, row)
+    if change == "oversize_identity":
+        assert "projected field bytes" in str(caught.value)
+        assert "required-identity" not in str(caught.value)
+
+
+def test_heavy_evidence_public_extract_and_independent_verify_report_omissions(
+    tmp_path, row, fields, heavy_native_signals
+):
+    fields["extra_fields"][0] = heavy_native_signals
+    plan = tmp_path / "plan.json"
+    plan.write_text(json.dumps(plan_for(row)))
+    unit = tmp_path / "unit.pkl"
+    unit.write_bytes(pickle.dumps({"field_data": fields, "storage_unit_id": "unit"}))
+    archive = tmp_path / "archive"
+    main(
+        [
+            "extract",
+            "--plan",
+            str(plan),
+            "--plan-sha256",
+            hashlib.sha256(plan.read_bytes()).hexdigest(),
+            "--unit",
+            str(unit),
+            "--max-unit-bytes",
+            str(unit.stat().st_size),
+            "--unit-position",
+            "0",
+            "--output",
+            str(archive),
+        ]
+    )
+    manifest = json.loads((archive / "manifest.json").read_bytes())
+    assert manifest["omitted_signal_items"]["reward_gate_decisions.trace.turns"] == 2000
+    output = tmp_path / "verified.json"
+    main(verify_args(plan, archive, output))
+    assert json.loads(output.read_bytes())["omitted_signal_items"] == manifest["omitted_signal_items"]
+    manifest["omitted_signal_items"].clear()
+    (archive / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="digest mismatch"):
+        main(verify_args(plan, archive, tmp_path / "bad-report.json"))
+
+
+def test_projected_gate_summary_keeps_turn_count_when_planned(row, fields):
+    from transfer_queue.lean_archive import light_values
+
+    row["signals"].update(light_values({"reward_gate_decisions": {"trace": {"turns": [{"evidence": "omitted"}]}}}))
+    record = project_row(fields, row)
+    assert record["signals"]["reward_gate_decisions"]["trace"]["turn_count"] == 1
+    assert record["signals"]["_omitted"]["reward_gate_decisions.trace.turns"] == 1
