@@ -17,11 +17,12 @@ import copy
 import os
 import pickle
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from functools import wraps
 from itertools import groupby
 from operator import itemgetter
-from threading import Thread
+from threading import RLock, Thread
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
@@ -53,6 +54,16 @@ if TYPE_CHECKING:
     from transfer_queue.metrics import TQMetricsExporter
 
 logger = get_logger(__name__)
+
+
+def _kv_locked(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self._kv_lock:
+            return method(self, *args, **kwargs)
+
+    return call
+
 
 TQ_CONTROLLER_GET_METADATA_TIMEOUT = int(os.environ.get("TQ_CONTROLLER_GET_METADATA_TIMEOUT", 1))
 TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL = int(os.environ.get("TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL", 5))
@@ -985,6 +996,9 @@ class TransferQueueController:
         self.controller_id = f"TQ_CONTROLLER_{uuid4().hex[:8]}"
         self.polling_mode = polling_mode
         self.tq_config = None  # global config for TransferQueue system
+        self._kv_lock = RLock()
+        self._kv_changes: deque[tuple[int, str, str, bool]] = deque(maxlen=65536)
+        self._reset_kv_delta()
 
         # Initialize ZMQ sockets for communication
         self._init_zmq_socket()
@@ -1009,6 +1023,7 @@ class TransferQueueController:
         logger.info(f"TransferQueue Controller {self.controller_id} initialized")
 
     # ==================== Partition Management API ====================
+    @_kv_locked
     def create_partition(self, partition_id: str) -> bool:
         """
         Create a new data partition with pre-allocated sample indexes.
@@ -1030,6 +1045,7 @@ class TransferQueueController:
             return False
 
         self.partitions[partition_id] = DataPartitionStatus(partition_id=partition_id)
+        self._reset_kv_delta()
 
         # Pre-allocate global indexes for consumer consumption tracking
         global_indexes = self.index_manager.allocate_indexes(partition_id, count=TQ_PRE_ALLOC_SAMPLE_NUM)
@@ -1167,6 +1183,7 @@ class TransferQueueController:
 
         return partition.get_production_status_for_fields(data_fields, mask=True)
 
+    @_kv_locked
     def set_custom_meta(self, partition_custom_meta: dict[str, dict[int, dict]]) -> None:
         """
         Set custom_meta for samples in partitions.
@@ -1200,6 +1217,10 @@ class TransferQueueController:
             partition = self._get_partition(partition_id)
             if partition:
                 partition.set_custom_meta(custom_meta)
+                self._record_kv_changes(
+                    partition_id,
+                    [partition.revert_keys_mapping[i] for i in custom_meta if i in partition.revert_keys_mapping],
+                )
             else:
                 logger.warning(
                     f"set_custom_meta: partition {partition_id}' not found; "
@@ -1509,6 +1530,7 @@ class TransferQueueController:
             if existing and partition.production_status is not None:
                 partition.production_status[existing, :] = 0
 
+    @_kv_locked
     def clear_partition(self, partition_id: str, clear_consumption: bool = True):
         """
         Clear data for a specific partition (delete the whole partition).
@@ -1531,6 +1553,7 @@ class TransferQueueController:
         partition.clear_data(global_indexes_range, clear_consumption)
         self.index_manager.release_partition(partition_id)
         self.partitions.pop(partition_id)
+        self._reset_kv_delta()
         self.sampler.clear_cache(partition_id)
 
     def reset_consumption(self, partition_id: str, task_name: str | None = None):
@@ -1554,6 +1577,7 @@ class TransferQueueController:
             return
         partition.reset_consumption(task_name)
 
+    @_kv_locked
     def clear_meta(
         self,
         global_indexes: list[int],
@@ -1612,11 +1636,16 @@ class TransferQueueController:
                 continue
 
             # Clear data from partition
+            removed_keys = [
+                partition.revert_keys_mapping[i] for i in global_indexes_to_clear if i in partition.revert_keys_mapping
+            ]
             partition.clear_data(global_indexes_to_clear, clear_consumption)
+            self._record_kv_changes(partition_id, removed_keys, deleted=True)
 
             # Release the specific indexes from index manager
             self.index_manager.release_indexes(partition_id, global_indexes_to_clear)
 
+    @_kv_locked
     def kv_retrieve_meta(
         self,
         keys: list[str],
@@ -1685,6 +1714,8 @@ class TransferQueueController:
                     global_indexes[none_indexes[i]] = batch_global_indexes[i]
                     partition.keys_mapping[keys[none_indexes[i]]] = batch_global_indexes[i]
                     partition.revert_keys_mapping[batch_global_indexes[i]] = keys[none_indexes[i]]
+
+                self._record_kv_changes(partition_id, [keys[i] for i in none_indexes])
 
                 partition.ensure_samples_capacity(max(batch_global_indexes) + 1)
 
@@ -2171,7 +2202,70 @@ class TransferQueueController:
         )
         return self._make_response(request_msg, ZMQRequestType.KV_RETRIEVE_KEYS_RESPONSE, {"keys": keys})
 
+    def _reset_kv_delta(self) -> None:
+        # Cursors are runtime-only: restoring or replacing partitions requires a full new view.
+        self._kv_instance = uuid4().hex
+        self._kv_revision = 0
+        self._kv_changes.clear()
+
+    def _record_kv_changes(self, partition_id: str, keys: list[str], *, deleted: bool = False) -> None:
+        for key in keys:
+            self._kv_revision += 1
+            removed = deleted and key not in self.partitions[partition_id].keys_mapping
+            self._kv_changes.append((self._kv_revision, partition_id, key, removed))
+
+    @_kv_locked
+    def kv_list_delta(self, cursor: str | None = None) -> dict:
+        """Return changed KV tags, or a full reset when a runtime cursor cannot be continued.
+
+        Apply deletions before upserts: a key may have been deleted and recreated.
+        A bounded journal avoids retaining historical tombstones indefinitely.
+        """
+        instance, _, revision_text = (cursor or "").partition(":")
+        revision = int(revision_text) if revision_text.isdecimal() else -1
+        oldest = self._kv_changes[0][0] - 1 if self._kv_changes else self._kv_revision
+        reset = instance != self._kv_instance or not oldest <= revision <= self._kv_revision
+        upserts: dict[str, dict[str, dict]] = {}
+        deleted: dict[str, set[str]] = {}
+        if reset:
+            upserts = {
+                pid: {key: part.custom_meta.get(index, {}) for key, index in part.keys_mapping.items()}
+                for pid, part in self.partitions.items()
+            }
+        elif revision != self._kv_revision:
+            changed: dict[tuple[str, str], None] = {}
+            suffix = []
+            for event in reversed(self._kv_changes):
+                if event[0] <= revision:
+                    break
+                suffix.append(event)
+            for version, pid, key, removed in reversed(suffix):
+                if removed:
+                    changed.pop((pid, key), None)
+                    deleted.setdefault(pid, set()).add(key)
+                else:
+                    changed[(pid, key)] = None
+            for pid, key in changed:
+                part = self.partitions[pid]
+                if key in part.keys_mapping:
+                    upserts.setdefault(pid, {})[key] = part.custom_meta.get(part.keys_mapping[key], {})
+                else:
+                    deleted.setdefault(pid, set()).add(key)
+        return {
+            "cursor": f"{self._kv_instance}:{self._kv_revision}",
+            "reset": reset,
+            "upserts": copy.deepcopy(upserts),
+            "deleted": {pid: sorted(keys) for pid, keys in deleted.items()},
+        }
+
+    @_kv_locked
     def _handle_kv_list_request(self, request_msg: ZMQMessage) -> ZMQMessage:
+        if "cursor" in request_msg.body:
+            return self._make_response(
+                request_msg,
+                ZMQRequestType.KV_LIST_RESPONSE,
+                {"metadata_delta": self.kv_list_delta(request_msg.body["cursor"])},
+            )
         requested_partition_id = request_msg.body["partition_id"]
         partition_ids = list(self.partitions.keys()) if requested_partition_id is None else [requested_partition_id]
         message = "success"
@@ -2258,6 +2352,7 @@ class TransferQueueController:
             raise RuntimeError(f"[{self.controller_id}]: save checkpoint failed: {e}") from e
         return None
 
+    @_kv_locked
     def load_checkpoint(self, path: str) -> None:
         """Restore controller state directly from a file.
 
@@ -2273,6 +2368,7 @@ class TransferQueueController:
 
             self.controller_id = state["controller_id"]
             self.partitions = state["partitions"]
+            self._reset_kv_delta()
 
             im = state["index_manager"]
             self.index_manager.partition_to_indexes = defaultdict(set, im["partition_to_indexes"])
