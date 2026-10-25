@@ -17,6 +17,7 @@ import asyncio
 import os
 import threading
 import weakref
+from contextlib import contextmanager
 from typing import Any, Callable
 
 import torch
@@ -90,6 +91,9 @@ class AsyncTransferQueueClient:
         if not isinstance(controller_info, ZMQServerInfo):
             raise TypeError(f"controller_info must be ZMQServerInfo, got {type(controller_info)}")
         self.client_id = client_id
+        self._metadata_write_lock = threading.Lock()
+        self._metadata_write_generation = 0
+        self._metadata_writes_in_flight = 0
         self._controller: ZMQServerInfo = controller_info
         # One long-lived context per client; sockets stay per-request because ZMQ sockets
         # are not thread-safe.
@@ -191,17 +195,52 @@ class AsyncTransferQueueClient:
             receiver_id=self._controller.id,
             body=body,
         )
-        await socket.send_multipart(request_msg.serialize())
-        response_serialized = await socket.recv_multipart(copy=False)
-        response_msg = ZMQMessage.deserialize(response_serialized)
-        logger.debug(f"[{self.client_id}]: Received {response_msg.request_type} from controller {self._controller.id}")
-        if response_msg.request_type != response_type:
-            message = response_msg.body.get("message", "Unknown error")
-            raise RuntimeError(
-                f"[{self.client_id}]: Expected {response_type}, got {response_msg.request_type} "
-                f"from controller {self._controller.id}: {message}"
+        mutates = (
+            request_type
+            in {
+                ZMQRequestType.SET_CUSTOM_META,
+                ZMQRequestType.CLEAR_META,
+                ZMQRequestType.CLEAR_PARTITION,
+                ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT,
+            }
+            or (request_type == ZMQRequestType.KV_RETRIEVE_META and body.get("create", False))
+            or (request_type == ZMQRequestType.GET_META and body.get("mode") == "insert")
+        )
+        if mutates:
+            with self._metadata_write_lock:
+                self._metadata_write_generation += 1
+                self._metadata_writes_in_flight += 1
+        try:
+            await socket.send_multipart(request_msg.serialize())
+            response_serialized = await socket.recv_multipart(copy=False)
+            response_msg = ZMQMessage.deserialize(response_serialized)
+            logger.debug(
+                f"[{self.client_id}]: Received {response_msg.request_type} from controller {self._controller.id}"
             )
-        return response_msg
+            if response_msg.request_type != response_type:
+                message = response_msg.body.get("message", "Unknown error")
+                raise RuntimeError(
+                    f"[{self.client_id}]: Expected {response_type}, got {response_msg.request_type} "
+                    f"from controller {self._controller.id}: {message}"
+                )
+            return response_msg
+        finally:
+            if mutates:
+                with self._metadata_write_lock:
+                    self._metadata_write_generation += 1
+                    self._metadata_writes_in_flight -= 1
+
+    @property
+    def metadata_write_stamp(self) -> tuple[int, int]:
+        """This client's writes only; controller cursors authenticate external writes."""
+        with self._metadata_write_lock:
+            return self._metadata_write_generation, self._metadata_writes_in_flight
+
+    @contextmanager
+    def metadata_apply_guard(self, stamp: tuple[int, int]):
+        """Apply a received view only if this client's writes did not race its fetch."""
+        with self._metadata_write_lock:
+            yield stamp == (self._metadata_write_generation, 0) and self._metadata_writes_in_flight == 0
 
     # ==================== Basic API ====================
     @with_controller_socket
@@ -1051,6 +1090,17 @@ class AsyncTransferQueueClient:
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in kv_list: {str(e)}") from e
 
+    @with_controller_socket
+    async def async_kv_list_delta(self, cursor: str | None = None, socket: zmq.asyncio.Socket | None = None) -> dict:
+        """Read changed KV tags since an opaque cursor; apply deletions before upserts."""
+        response = await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.KV_LIST,
+            response_type=ZMQRequestType.KV_LIST_RESPONSE,
+            body={"partition_id": None, "cursor": cursor},
+        )
+        return response.body["metadata_delta"]
+
     def close(self) -> None:
         """Close the client and cleanup resources including storage manager.
 
@@ -1293,6 +1343,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self._kv_retrieve_meta = _make_sync(self.async_kv_retrieve_meta)
         self._kv_retrieve_keys = _make_sync(self.async_kv_retrieve_keys)
         self._kv_list = _make_sync(self.async_kv_list)
+        self._kv_list_delta = _make_sync(self.async_kv_list_delta)
         self._save_controller_checkpoint = _make_sync(self.async_save_controller_checkpoint)
         self._load_controller_checkpoint = _make_sync(self.async_load_controller_checkpoint)
         self._save_storage_checkpoint = _make_sync(self.async_save_storage_checkpoint)
@@ -1742,6 +1793,10 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """
 
         return self._kv_list(partition_id=partition_id)
+
+    def kv_list_delta(self, cursor: str | None = None) -> dict:
+        """Read changed KV tags since an opaque cursor; a reset replaces the complete view."""
+        return self._kv_list_delta(cursor=cursor)
 
     # ==================== Checkpoint API ====================
     def save_controller_checkpoint(self, path: str, *, frontier: bool = False) -> dict | None:

@@ -563,6 +563,22 @@ def kv_list(partition_id: str | None = None) -> dict[str, dict[str, Any]]:
     return tq_client._run_coroutine(async_kv_list(partition_id=partition_id))
 
 
+def kv_list_delta(cursor: str | None = None) -> dict:
+    """Read changed KV metadata across all partitions.
+
+    A first, expired, or restored cursor returns a full ``reset`` view. Otherwise
+    apply ``deleted`` keys before ``upserts`` and retain the returned ``cursor``.
+    Cursors and the bounded change journal are ephemeral and are not checkpoints.
+    """
+    client = _maybe_create_tq_client()
+    return client._run_coroutine(async_kv_list_delta(cursor=cursor))
+
+
+async def async_kv_list_delta(cursor: str | None = None) -> dict:
+    """Async version of :func:`kv_list_delta`, with identical reset/deletion semantics."""
+    return await _maybe_create_tq_client().async_kv_list_delta(cursor=cursor)
+
+
 def kv_clear(keys: list[str] | str, partition_id: str) -> None:
     """Clear key-value pairs from TransferQueue.
 

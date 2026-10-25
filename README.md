@@ -123,6 +123,10 @@ To simplify the usage of TransferQueue, we provide a Redis-style high-level API 
 - **(async_)kv_batch_put**: Put multiple key-value pairs efficiently in batches.
 - **(async_)kv_batch_get**: Retrieve samples (by keys), supporting column selection (by fields).
 - **(async_)kv_list**: List keys and tags (metadata) in a partition.
+- **(async_)kv_list_delta**: Read changed keys and tags across partitions using an
+  opaque runtime cursor. Apply deletions before upserts; a `reset` replaces the
+  entire view. Restore, partition replacement, or journal overflow returns a
+  full reset instead of silently losing changes. Existing `kv_list` is unchanged.
 - **(async_)kv_clear**: Remove key-value pairs from storage.
 
 Column-selected GETs project field schemas in the controller and omit user tags
