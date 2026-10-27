@@ -1115,11 +1115,12 @@ def save_checkpoint(
     SimpleStorage captures detached field maps before returning a Future. The
     caller must join that Future before publishing its enclosing checkpoint.
     Existing-row mutations must be quiesced through capture; fresh append-only
-    producers may continue. Controller state, including sampler state, stays at
-    the synchronous capture frontier. Unknown payload ownership or a retention
-    estimate above ``max_snapshot_bytes`` falls back to a synchronous write.
-    The positive byte budget covers retained payload stores and map estimates,
-    not a process RSS limit or pickle's transient memory. Only one save can be
+    producers may continue. Controller state, including sampler state, is
+    serialized at the capture frontier and written by the Future's writer. A
+    storage unit whose private memory fits its share of ``max_snapshot_bytes``
+    skips per-payload accounting; otherwise unknown payload ownership or a
+    retention estimate above the budget falls back to a synchronous write. The
+    positive byte budget covers retained payloads, not pickle's transient memory. Only one save can be
     pending; a failed save prevents another cut until its enclosing owner has
     settled every writer and explicitly retired the failed cut.
     Other storage backends retain their synchronous behavior. ``include_storage``
@@ -1154,8 +1155,10 @@ def save_checkpoint(
         writers_started = False
         try:
             controller_path = str(tmp_dir / _CONTROLLER_FILE)
+            controller_state = None
             if detached:
                 frontier = cast(dict, client.save_controller_checkpoint(controller_path, frontier=True))
+                controller_state = frontier["state"]
             else:
                 client.save_controller_checkpoint(controller_path)
             prepared = None
@@ -1200,6 +1203,11 @@ def save_checkpoint(
                     pass
 
             def finish():
+                if controller_state is not None:
+                    with open(controller_path, "wb") as stream:
+                        stream.write(controller_state)
+                        stream.flush()
+                        os.fsync(stream.fileno())
                 if detached:
                     deadline = time.monotonic() + timeout_s
                     while True:

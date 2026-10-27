@@ -386,10 +386,14 @@ old unpacked frames and checkpoints. Checkpoint packing restores the logical
 dtype through ordinary Torch reducers, including for the shifted sentinel.
 Disjoint route rows from decoded dense/jagged batches remain eligible.
 
-Snapshot ownership accounting traverses TensorDict metadata through its public
-dictionary projection. Unknown payload ownership still selects synchronous
-storage. Each storage cut logs its accounted bytes, budget and async decision
-before starting a write; a larger budget alone cannot admit unknown ownership.
+A capture cannot retain more than its storage unit's private writable memory
+(`VmData`). When that already fits the unit's divided budget, the cut copies the
+field maps and reports that bound without visiting payload objects, so its cost
+follows row and field counts rather than payload size. Otherwise ownership
+accounting traverses each payload, including TensorDict metadata through its
+public dictionary projection, and unknown payload ownership selects synchronous
+storage. Each storage cut logs its retained bytes, budget and async decision
+before starting a write.
 
 Each existing per-unit checkpoint file streams the same logical pickle through
 zstd level 1, using the existing `TQ_NUM_THREADS` budget for parallel compression.
@@ -412,27 +416,27 @@ query without starting a monitor; its default remains unchanged.
 
 For detached SimpleStorage saves, committed `metadata.json` includes an optional
 `storage_checkpoint` receipt: aggregate async/fallback mode and the existing
-per-unit ID, IP, preparation flag, accounted retained bytes (or `null` when
-unknown), and divided byte cap. It uses the preparation replies, with no payload
-read or additional RPC. The receipt is limited to 256 units and fixed primitive
+per-unit ID, IP, preparation flag, retained bytes (the private-memory bound or
+the accounted estimate, `null` when unknown), and divided byte cap. It uses the
+preparation replies, with no payload read or additional RPC. The receipt is limited to 256 units and fixed primitive
 fields; invalid diagnostics are omitted. Its absence means mode is unknown.
 Only publication of the checkpoint attests durability; receipt construction is
 best-effort, while preparation, writes, metadata persistence and fsync retain
 their existing failures. The receipt is not an RSS or free-memory measurement.
 
-`save_checkpoint(..., async_storage=True, max_snapshot_bytes=...)` keeps the
-controller and sampler cut synchronous, captures replace-only SimpleStorage
-payload references, then returns a future for durable storage and publication.
+`save_checkpoint(..., async_storage=True, max_snapshot_bytes=...)` serializes the
+controller and sampler cut on the controller's request thread, captures
+replace-only SimpleStorage payload references, then returns a future that writes
+the controller state and payloads durably before publication.
 Quiesce existing ready-row mutations through capture; fresh append-only producers
 may continue. Join the future before publishing an enclosing checkpoint or
 closing TransferQueue. Only one save may be pending. The payload frontier uses
 ownership from the snapshotted partitions, including recycled indexes. The legacy
 `allocated_indexes` metadata is preserved but does not define that frontier.
-Unaccountable payloads or a per-unit retention estimate above the divided byte
-budget use synchronous writes.
-This budget bounds accounted retained stores and map estimates, not process RSS
-or serialization scratch space. Other backends and the default API stay
-synchronous. Writer failure leaves staging uncommitted and prevents another save
+A unit whose private memory exceeds the divided byte budget falls back to
+accounting; unaccountable payloads or an estimate above the budget use
+synchronous writes. The budget bounds retained payloads, not serialization
+scratch space. Other backends and the default API stay synchronous. Writer failure leaves staging uncommitted and prevents another save
 in that client process; allocation teardown owns an uninterruptible filesystem
 thread. Checkpoints require a shared filesystem for multiple nodes.
 

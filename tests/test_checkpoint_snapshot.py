@@ -33,7 +33,36 @@ def test_unknown_payload_ownership_selects_synchronous_fallback():
     assert size is None
 
 
-def test_controller_freezes_sampler_before_serialization(tmp_path, monkeypatch):
+class _Unmeasurable:
+    """A payload whose size cannot be taken, so any per-object walk over it fails."""
+
+    def __sizeof__(self):
+        raise AssertionError("capture walked a payload object")
+
+
+def test_capture_within_private_memory_budget_copies_maps_without_walking_payloads():
+    data = StorageUnitData(storage_size=4)
+    backing = torch.arange(4096)
+    data.put_data({"tokens": [backing[:2], torch.tensor([7])], "opaque": [_Unmeasurable(), SimpleNamespace()]}, [0, 1])
+    snapshot, size = data.checkpoint_snapshot({0}, 1 << 50)
+    assert size is not None and size >= backing.untyped_storage().nbytes()
+    data.put_data({"tokens": [torch.tensor([99])]}, [0])
+    data.clear([0, 1])
+    assert torch.equal(snapshot["field_data"]["tokens"][0], torch.tensor([0, 1]))
+    assert set(snapshot["field_data"]["tokens"]) == {0} and snapshot["active_keys"] == {0}
+    with pytest.raises(AssertionError, match="walked"):
+        data.put_data({"opaque": [_Unmeasurable()]}, [2])
+        data.checkpoint_snapshot({2}, 1)
+
+
+def test_capture_over_private_memory_budget_keeps_the_ownership_walk():
+    data = StorageUnitData(storage_size=4)
+    data.put_data({"opaque": [SimpleNamespace(value=1)]}, [0])
+    _, size = data.checkpoint_snapshot({0}, 1)
+    assert size is None
+
+
+def test_controller_cut_is_serialized_before_the_request_returns(tmp_path):
     impl = TransferQueueController.__ray_metadata__.modified_class
     controller = object.__new__(impl)
     controller.controller_id, controller.partitions = "snapshot-control", {}
@@ -45,21 +74,18 @@ def test_controller_freezes_sampler_before_serialization(tmp_path, monkeypatch):
     )
     sampler_state = {"cursor": [3]}
     controller.sampler = SimpleNamespace(save_checkpoint=lambda: sampler_state)
-    original = pickle.dump
-
-    def change_live_sampler(state, stream, **kwargs):
-        sampler_state["cursor"][0] = 9
-        return original(state, stream, **kwargs)
-
-    monkeypatch.setattr(pickle, "dump", change_live_sampler)
     path = tmp_path / "controller.pkl"
-    assert controller.save_checkpoint(str(path), return_frontier=True) == []
+    cut = controller.save_checkpoint(str(path), return_frontier=True)
+    sampler_state["cursor"][0] = 9
+    assert cut["indexes"] == []
+    assert pickle.loads(cut["state"])["sampler"] == {"cursor": [3]}
+    assert not path.exists(), "a detached cut leaves the file write to the save's writer"
+    controller.save_checkpoint(str(path))
     with path.open("rb") as stream:
-        assert pickle.load(stream)["sampler"] == {"cursor": [3]}
-    assert sampler_state == {"cursor": [9]}
+        assert pickle.load(stream)["sampler"] == {"cursor": [9]}
 
 
-def test_controller_frontier_keeps_recycled_indexes_at_the_saved_cut(tmp_path, monkeypatch):
+def test_controller_frontier_keeps_recycled_indexes_at_the_saved_cut():
     manager = PartitionIndexManager()
     assert manager.allocate_indexes("retired", 2) == [0, 1]
     manager.release_partition("retired")
@@ -75,25 +101,17 @@ def test_controller_frontier_keeps_recycled_indexes_at_the_saved_cut(tmp_path, m
     }
     sampler = {"cursor": [17]}
     controller.sampler = SimpleNamespace(save_checkpoint=lambda: sampler)
-    original_dump = pickle.dump
-
-    def append_after_cut(state, stream, **kwargs):
-        # Tensor serialization can call pickle.dump again.
-        # Mutate the live state only once for this cut.
-        if "after-cut" not in manager.partition_to_indexes:
-            manager.allocate_indexes("after-cut", 1)
-            sampler["cursor"][0] = 99
-        return original_dump(state, stream, **kwargs)
-
-    monkeypatch.setattr(pickle, "dump", append_after_cut)
-    path = tmp_path / "controller.pkl"
-    frontier = controller.save_checkpoint(str(path), return_frontier=True)
-    with path.open("rb") as stream:
-        saved = pickle.load(stream)
-    assert frontier == [0, 1, 2]
-    assert set(frontier) == set().union(*saved["index_manager"]["partition_to_indexes"].values())
+    cut = controller.save_checkpoint("unused", return_frontier=True)
+    # Requests served after the cut must not reach the serialized state.
+    manager.allocate_indexes("after-cut", 1)
+    manager.partition_to_indexes["train"].add(9)
+    sampler["cursor"][0] = 99
+    saved = pickle.loads(cut["state"])
+    assert cut["indexes"] == [0, 1, 2]
+    assert set(cut["indexes"]) == set().union(*saved["index_manager"]["partition_to_indexes"].values())
     assert saved["index_manager"]["allocated_indexes"] == {2}
     assert saved["sampler"] == {"cursor": [17]}
+    assert saved["partitions"]["train"].global_indexes == {0}
     assert manager.partition_to_indexes["after-cut"] == {3}
     assert manager.allocated_indexes == {2, 3}
 
@@ -177,12 +195,12 @@ def _install_unit_control(tq, key, value, tmp_path, *, capture=False, prepare_fa
 
         original_capture, original_dump = StorageUnitData.checkpoint_snapshot, pickle.dump
 
-        def checkpoint_snapshot(storage, indexes):
+        def checkpoint_snapshot(storage, indexes, **kwargs):
             if capture:
                 wait("capture")
                 if prepare_fail:
                     raise RuntimeError("injected storage capture failure")
-            snapshot = original_capture(storage, indexes)
+            snapshot = original_capture(storage, indexes, **kwargs)
             (root / "captured").touch()
             return snapshot
 
@@ -244,8 +262,9 @@ def _wait_unit(tq, checkpoint, unit, *, failed=False):
         time.sleep(0.01)
 
 
+@pytest.mark.parametrize("budget", [1024 * 1024, 1 << 50], ids=["accounted", "within-private-memory"])
 @pytest.mark.parametrize("failure", [None, "write", "prepare"], ids=["success", "write-failure", "prepare-failure"])
-def test_two_unit_capture_frontier_and_partial_failure(two_units, tmp_path, failure):
+def test_two_unit_capture_frontier_and_partial_failure(two_units, tmp_path, failure, budget):
     import hashlib
     from concurrent.futures import ThreadPoolExecutor
 
@@ -266,7 +285,7 @@ def test_two_unit_capture_frontier_and_partial_failure(two_units, tmp_path, fail
     assert {unit[0] for unit in units} == {0, 1}
     path, staging = tmp_path / "checkpoint", tmp_path / "checkpoint.tmp"
     with ThreadPoolExecutor(max_workers=1) as executor:
-        capture = executor.submit(tq.save_checkpoint, path, async_storage=True, max_snapshot_bytes=1024 * 1024)
+        capture = executor.submit(tq.save_checkpoint, path, async_storage=True, max_snapshot_bytes=budget)
         try:
             _wait_file(gates[0] / "write-entered")
             _wait_file(gates[1] / "capture-entered")
