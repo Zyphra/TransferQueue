@@ -142,6 +142,18 @@ def _read_storage_checkpoint(path):
         return state
 
 
+def _private_memory_bytes() -> int | None:
+    """Private writable memory (VmData) of this process, or None where Linux does not report it."""
+    try:
+        with open("/proc/self/status") as stream:
+            for line in stream:
+                if line.startswith("VmData:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 class StorageUnitData:
     """Storage unit for managing 2D data structure (samples × fields).
 
@@ -272,10 +284,13 @@ class StorageUnitData:
                 self.field_data[f].pop(key, None)
         self._active_keys -= set(keys)
 
-    def checkpoint_snapshot(self, indexes: set[int]) -> tuple[dict, int | None]:
+    def checkpoint_snapshot(self, indexes: set[int], max_bytes: int | None = None) -> tuple[dict, int | None]:
         """Retain replace-only values without retaining the live field maps.
 
-        Count full backing stores, including tensor views. Unknown object ownership
+        A capture cannot retain more than the process's private writable memory.
+        When that already fits ``max_bytes``, report it instead of walking every
+        payload object, so the cut costs one map copy per field. Otherwise count
+        full backing stores, including tensor views; unknown object ownership
         selects the synchronous path instead of guessing a retention budget.
         """
         fields = {
@@ -283,6 +298,10 @@ class StorageUnitData:
             for name, rows in self.field_data.items()
         }
         active = self._active_keys & indexes
+        if max_bytes is not None:
+            held = _private_memory_bytes()
+            if held is not None and held <= max_bytes:
+                return {"field_data": fields, "active_keys": active}, held
         stores: set[tuple[int, int] | int] = set()
         pending, seen, size, projections = [fields, active], set(), 0, []
         while pending:
@@ -799,7 +818,9 @@ class SimpleStorageUnit:
             }
             retained_bytes = None
             if phase == "prepare":
-                detached, retained_bytes = self.storage_data.checkpoint_snapshot(set(data_parts.body["indexes"]))
+                detached, retained_bytes = self.storage_data.checkpoint_snapshot(
+                    set(data_parts.body["indexes"]), max_bytes=data_parts.body["max_snapshot_bytes"]
+                )
                 state.update(detached)
             elif phase != "save":
                 raise ValueError("unknown checkpoint phase")
