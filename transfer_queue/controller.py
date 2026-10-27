@@ -2192,13 +2192,11 @@ class TransferQueueController:
         )
 
     def _handle_save_controller_checkpoint_request(self, request_msg: ZMQMessage) -> ZMQMessage:
-        frontier = self.save_checkpoint(
-            request_msg.body["path"], return_frontier=request_msg.body.get("frontier", False)
-        )
+        cut = self.save_checkpoint(request_msg.body["path"], return_frontier=request_msg.body.get("frontier", False))
         return self._make_response(
             request_msg,
             ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT_RESPONSE,
-            {"success": True, **({"indexes": frontier} if frontier is not None else {})},
+            {"success": True, **(cut or {})},
         )
 
     def _handle_load_controller_checkpoint_request(self, request_msg: ZMQMessage) -> ZMQMessage:
@@ -2221,39 +2219,43 @@ class TransferQueueController:
         """Retrieve the global config of TransferQueue."""
         return self.tq_config
 
-    def save_checkpoint(self, path: str, *, return_frontier: bool = False) -> list[int] | None:
-        """Serialize controller state directly to a file.
+    def save_checkpoint(self, path: str, *, return_frontier: bool = False) -> dict | None:
+        """Serialize controller state at a consistent cut.
 
-        Writes in-process to avoid transmitting the payload back over the
-        Ray object store.
-
-        Args:
-            path: Absolute path for the output .pkl file.
+        Pickling the live maps on the request thread is the snapshot: no request
+        can mutate them meanwhile, so no deep copy is needed. A plain save writes
+        ``path`` here. ``return_frontier`` instead returns the serialized state and
+        the payload frontier, and the caller writes ``path`` off this thread, so
+        metadata requests resume after serialization rather than a file write.
 
         Raises:
             Exception: If serialization or file I/O fails.
         """
         try:
-            state: dict[str, Any] = {
-                "controller_id": self.controller_id,
-                "partitions": {pid: p.to_snapshot() for pid, p in self.partitions.items()},
-                "index_manager": {
-                    "partition_to_indexes": dict(copy.deepcopy(self.index_manager.partition_to_indexes)),
-                    "reusable_indexes": list(self.index_manager.reusable_indexes),
-                    "global_index_counter": self.index_manager.global_index_counter,
-                    "allocated_indexes": set(self.index_manager.allocated_indexes),
+            manager = self.index_manager
+            state = pickle.dumps(
+                {
+                    "controller_id": self.controller_id,
+                    "partitions": self.partitions,
+                    "index_manager": {
+                        "partition_to_indexes": dict(manager.partition_to_indexes),
+                        "reusable_indexes": list(manager.reusable_indexes),
+                        "global_index_counter": manager.global_index_counter,
+                        "allocated_indexes": set(manager.allocated_indexes),
+                    },
+                    "sampler": self.sampler.save_checkpoint(),
                 },
-                "sampler": copy.deepcopy(self.sampler.save_checkpoint()),
-            }
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+            if return_frontier:
+                # Recycled indexes can be absent from the legacy allocated set.
+                # Use ownership at this same cut.
+                return {"indexes": sorted(set().union(*manager.partition_to_indexes.values())), "state": state}
             with open(path, "wb") as f:
-                pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+                f.write(state)
                 f.flush()
                 os.fsync(f.fileno())
             logger.info(f"[{self.controller_id}]: dumped to {path}")
-            if return_frontier:
-                # Recycled indexes can be absent from the legacy allocated set.
-                # Use ownership from the same detached controller snapshot.
-                return sorted(set().union(*state["index_manager"]["partition_to_indexes"].values()))
         except Exception as e:
             raise RuntimeError(f"[{self.controller_id}]: save checkpoint failed: {e}") from e
         return None
