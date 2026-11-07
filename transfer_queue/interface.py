@@ -1117,7 +1117,7 @@ def save_checkpoint(
     Existing-row mutations must be quiesced through capture; fresh append-only
     producers may continue. Controller state, including sampler state, is
     serialized at the capture frontier and written by the Future's writer. A
-    storage unit whose private memory fits its share of ``max_snapshot_bytes``
+    storage unit whose counted payload fits its share of ``max_snapshot_bytes``
     skips per-payload accounting; otherwise unknown payload ownership or a
     retention estimate above the budget falls back to a synchronous write. The
     positive byte budget covers retained payloads, not pickle's transient memory. Only one save can be

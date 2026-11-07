@@ -3,6 +3,7 @@
 """Payload ownership and sampler detachment for bounded checkpoint capture."""
 
 import pickle
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -33,33 +34,57 @@ def test_unknown_payload_ownership_selects_synchronous_fallback():
     assert size is None
 
 
-class _Unmeasurable:
-    """A payload whose size cannot be taken, so any per-object walk over it fails."""
-
-    def __sizeof__(self):
-        raise AssertionError("capture walked a payload object")
-
-
-def test_capture_within_private_memory_budget_copies_maps_without_walking_payloads():
+def test_capture_within_counted_payload_budget_copies_maps_without_walking_payloads(monkeypatch):
     data = StorageUnitData(storage_size=4)
     backing = torch.arange(4096)
-    data.put_data({"tokens": [backing[:2], torch.tensor([7])], "opaque": [_Unmeasurable(), SimpleNamespace()]}, [0, 1])
-    snapshot, size = data.checkpoint_snapshot({0}, 1 << 50)
-    assert size is not None and size >= backing.untyped_storage().nbytes()
+    data.put_data({"tokens": [backing[:2], torch.tensor([7])], "meta": [{"turns": [1, 2]}, "b"]}, [0, 1])
+
+    def walked(*args, **kwargs):
+        raise AssertionError("capture walked a payload object")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sys, "getsizeof", walked)
+        snapshot, size = data.checkpoint_snapshot({0}, 1 << 50)
+    assert size == data.payload_bytes and size >= backing.untyped_storage().nbytes()
     data.put_data({"tokens": [torch.tensor([99])]}, [0])
     data.clear([0, 1])
     assert torch.equal(snapshot["field_data"]["tokens"][0], torch.tensor([0, 1]))
+    assert snapshot["field_data"]["meta"][0] == {"turns": [1, 2]}
     assert set(snapshot["field_data"]["tokens"]) == {0} and snapshot["active_keys"] == {0}
-    with pytest.raises(AssertionError, match="walked"):
-        data.put_data({"opaque": [_Unmeasurable()]}, [2])
-        data.checkpoint_snapshot({2}, 1)
 
 
-def test_capture_over_private_memory_budget_keeps_the_ownership_walk():
+def test_unaccountable_payload_within_budget_keeps_the_ownership_walk():
     data = StorageUnitData(storage_size=4)
     data.put_data({"opaque": [SimpleNamespace(value=1)]}, [0])
+    assert data.unaccounted_values == 1
+    _, size = data.checkpoint_snapshot({0}, 1 << 50)
+    assert size is None
+    data.clear([0])
+    assert data.unaccounted_values == 0
+
+
+def test_capture_over_counted_payload_budget_keeps_the_ownership_walk():
+    data = StorageUnitData(storage_size=4)
+    data.put_data({"tokens": [torch.arange(8)], "opaque": [SimpleNamespace(value=1)]}, [0])
     _, size = data.checkpoint_snapshot({0}, 1)
     assert size is None
+
+
+def test_payload_count_follows_put_replace_clear_and_restore():
+    data = StorageUnitData(storage_size=8)
+    rows = [torch.arange(16), torch.zeros(4, dtype=torch.float32)]
+    tensor_overhead = sys.getsizeof(rows[0]) + 4096
+    data.put_data({"tokens": rows}, [0, 1])
+    assert data.payload_bytes == 16 * 8 + 4 * 4 + 2 * tensor_overhead
+    data.put_data({"tokens": [torch.arange(2)]}, [0])
+    assert data.payload_bytes == 2 * 8 + 4 * 4 + 2 * tensor_overhead
+    data.clear([1, 5])
+    assert data.payload_bytes == 2 * 8 + tensor_overhead
+    restored = StorageUnitData(storage_size=8)
+    restored.replace({"tokens": {3: torch.arange(3)}}, {3})
+    assert restored.payload_bytes == 3 * 8 + tensor_overhead and restored.active_key_count == 1
+    data.clear([0])
+    assert data.payload_bytes == 0
 
 
 def test_controller_cut_is_serialized_before_the_request_returns(tmp_path):

@@ -386,8 +386,9 @@ old unpacked frames and checkpoints. Checkpoint packing restores the logical
 dtype through ordinary Torch reducers, including for the shifted sentinel.
 Disjoint route rows from decoded dense/jagged batches remain eligible.
 
-A capture cannot retain more than its storage unit's private writable memory
-(`VmData`). When that already fits the unit's divided budget, the cut copies the
+A capture cannot retain more payload than its storage unit holds. Each unit
+counts the storage bytes of the values it stores as they are put, replaced and
+cleared. When that count already fits the unit's divided budget, the cut copies the
 field maps and reports that bound without visiting payload objects, so its cost
 follows row and field counts rather than payload size. Otherwise ownership
 accounting traverses each payload, including TensorDict metadata through its
@@ -433,7 +434,7 @@ may continue. Join the future before publishing an enclosing checkpoint or
 closing TransferQueue. Only one save may be pending. The payload frontier uses
 ownership from the snapshotted partitions, including recycled indexes. The legacy
 `allocated_indexes` metadata is preserved but does not define that frontier.
-A unit whose private memory exceeds the divided byte budget falls back to
+A unit whose counted payload exceeds the divided byte budget falls back to
 accounting; unaccountable payloads or an estimate above the budget use
 synchronous writes. The budget bounds retained payloads, not serialization
 scratch space. Other backends and the default API stay synchronous. Writer failure leaves staging uncommitted and prevents another save
