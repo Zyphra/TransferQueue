@@ -18,7 +18,8 @@ def test_snapshot_retains_original_values_and_full_tensor_backing_store():
     backing = torch.arange(4096)
     data.put_data({"tokens": [backing[:2]], "nested": [{"original": [1, 2]}]}, [0])
     snapshot, size = data.checkpoint_snapshot({0})
-    assert size >= backing.untyped_storage().nbytes()
+    stored = data.field_data["tokens"][0].untyped_storage().nbytes()
+    assert stored == 2 * backing.element_size() and size >= stored
     data.put_data({"tokens": [torch.tensor([99])], "nested": [{"changed": True}]}, [0])
     data.clear([0])
     data.put_data({"tokens": [torch.tensor([100])]}, [0])
@@ -45,7 +46,7 @@ def test_capture_within_counted_payload_budget_copies_maps_without_walking_paylo
     with monkeypatch.context() as patch:
         patch.setattr(sys, "getsizeof", walked)
         snapshot, size = data.checkpoint_snapshot({0}, 1 << 50)
-    assert size == data.payload_bytes and size >= backing.untyped_storage().nbytes()
+    assert size == data.payload_bytes and data.field_data["tokens"][0].untyped_storage().nbytes() == 2 * 8
     data.put_data({"tokens": [torch.tensor([99])]}, [0])
     data.clear([0, 1])
     assert torch.equal(snapshot["field_data"]["tokens"][0], torch.tensor([0, 1]))
@@ -382,7 +383,8 @@ def test_two_unit_mixed_budget_fallback_waits_for_detached_writer(two_units, tmp
     from concurrent.futures import ThreadPoolExecutor
 
     tq = two_units
-    values = [torch.arange(12), torch.arange(3072)]
+    # The large value is neither a range nor narrowable, so it keeps 24 KiB of int64 storage.
+    values = [torch.arange(12), torch.arange(3072) * 7 + (1 << 40)]
     gates = [tmp_path / "small", tmp_path / "large"]
     for index, value in enumerate(values):
         tq.kv_put(key=f"row{index}", partition_id="two-su", fields={"tokens": value})

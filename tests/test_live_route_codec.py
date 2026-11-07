@@ -168,6 +168,7 @@ def test_optional_route_stats_are_metadata_only_and_deduplicate_backing(monkeypa
     assert response == dict(
         row_count=4,
         packed_rows=1,
+        nibble_rows=0,
         unpacked_rows=2,
         unknown_rows=1,
         logical_view_bytes_known=50,

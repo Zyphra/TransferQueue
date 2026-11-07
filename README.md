@@ -386,6 +386,14 @@ old unpacked frames and checkpoints. Checkpoint packing restores the logical
 dtype through ordinary Torch reducers, including for the shifted sentinel.
 Disjoint route rows from decoded dense/jagged batches remain eligible.
 
+Stored rows of at least 512 elements also use compact physical bytes. A row of
+route IDs in 0..15 is stored two IDs per byte; rows with the -1 sentinel or wider
+IDs keep uint8. An int64 row stores `arange(start, stop)` as its bounds (text
+position IDs) and otherwise uses the narrowest integer dtype that holds its
+values (token IDs in int32, masks in uint8). Gets and checkpoint readers restore
+the original dtype, shape and values; float rows are unchanged. Each stored row
+owns its storage, so a surviving row never pins a sibling's batch frame.
+
 A capture cannot retain more payload than its storage unit holds. Each unit
 counts the storage bytes of the values it stores as they are put, replaced and
 cleared. When that count already fits the unit's divided budget, the cut copies the

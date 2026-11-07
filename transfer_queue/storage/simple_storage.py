@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ctypes
 import hashlib
+import math
 import os
 import pickle
 import sys
@@ -36,7 +38,16 @@ from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
-from transfer_queue.utils.route_codec import PackedRoutes, pack_route_fields, packable_route_ids
+from transfer_queue.utils.route_codec import (
+    Arange,
+    NarrowInts,
+    NibbleRoutes,
+    PackedRoutes,
+    compact_row,
+    pack_route_fields,
+    packable_route_ids,
+    restore_row,
+)
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -55,6 +66,19 @@ logger = get_logger(__name__)
 TQ_STORAGE_POLLER_TIMEOUT = int(os.environ.get("TQ_STORAGE_POLLER_TIMEOUT", 5))  # in seconds
 TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
 _CHECKPOINT_MAGIC = b"TQZSTD1\0"
+# glibc keeps freed row frames in its arenas, so RSS stays at its high-water mark
+# after rows drain. Large releases return those pages; other C libraries skip this.
+_TRIM_MIN_RELEASED_BYTES = 1 << 30
+
+
+def _libc_malloc_trim():
+    # Looked up per call: a ctypes function at module scope cannot cross Ray's pickling.
+    try:
+        return ctypes.CDLL("libc.so.6").malloc_trim
+    except (OSError, AttributeError):
+        return None
+
+
 _CHECKPOINT_HEADER_SIZE = len(_CHECKPOINT_MAGIC) + 8 + 32
 
 
@@ -148,7 +172,9 @@ def _payload_bytes(value) -> int | None:
     Sizes follow the capture walk below, except that tensor and array storage is
     counted once per value, so shared storage is over-counted.
     """
-    if isinstance(value, PackedRoutes):
+    if isinstance(value, Arange):
+        return sys.getsizeof(value)
+    if isinstance(value, PackedRoutes | NibbleRoutes | NarrowInts):
         value = value.data
     if type(value) is torch.Tensor:
         if value.device.type != "cpu" or value.layout != torch.strided or value.is_nested:
@@ -173,6 +199,22 @@ def _payload_bytes(value) -> int | None:
             return None
         total += size
     return total
+
+
+def _owned_row(value):
+    """Copy a row view out of its batch storage.
+
+    A row of a batched put shares the whole batch's storage: one surviving row keeps
+    every sibling's bytes resident, and pickling the row writes the entire storage.
+    """
+    if (
+        type(value) is torch.Tensor
+        and value.layout == torch.strided
+        and not value.is_nested
+        and value.untyped_storage().nbytes() > value.numel() * value.element_size()
+    ):
+        return value.clone()
+    return value
 
 
 class StorageUnitData:
@@ -209,6 +251,7 @@ class StorageUnitData:
         stats: dict[str, Any] = dict(
             row_count=0,
             packed_rows=0,
+            nibble_rows=0,
             unpacked_rows=0,
             unknown_rows=0,
             logical_view_bytes_known=0,
@@ -219,6 +262,11 @@ class StorageUnitData:
         stores = set()
         for value in self.field_data.get("routed_experts", {}).values():
             stats["row_count"] += 1
+            if isinstance(value, NibbleRoutes):
+                stats["nibble_rows"] += 1
+                stats["stored_view_bytes_known"] += value.data.nbytes
+                stats["logical_view_bytes_known"] += 2 * math.prod(value.shape)
+                continue
             packed = isinstance(value, PackedRoutes)
             tensor = value.data if packed else value
             if (
@@ -261,11 +309,9 @@ class StorageUnitData:
                     f"StorageUnitData get_data: field '{field}' not found. Available: {list(self.field_data.keys())}"
                 )
             try:
-                result[field] = [self.field_data[field][k] for k in global_indexes]
-                if not packed_routes:
-                    result[field] = [
-                        value.restore() if isinstance(value, PackedRoutes) else value for value in result[field]
-                    ]
+                result[field] = [
+                    restore_row(self.field_data[field][k], packed_routes=packed_routes) for k in global_indexes
+                ]
             except KeyError as e:
                 raise KeyError(f"StorageUnitData get_data: key {e} not found in field '{field}'") from e
         return result
@@ -295,6 +341,7 @@ class StorageUnitData:
                 self.field_data[f] = {}
             field_dict = self.field_data[f]
             for key, val in zip(global_indexes, values, strict=True):
+                val = compact_row(_owned_row(val))
                 if key in field_dict:
                     self._account(field_dict[key], -1)
                 self._account(val, 1)
@@ -318,8 +365,9 @@ class StorageUnitData:
         self.field_data, self._active_keys = field_data, active_keys
         self.payload_bytes = self.unaccounted_values = 0
         for rows in field_data.values():
-            for value in rows.values():
-                self._account(value, 1)
+            for key, value in rows.items():
+                rows[key] = compact_row(value)
+                self._account(rows[key], 1)
 
     def _account(self, value, sign: int) -> None:
         size = _payload_bytes(value)
@@ -353,8 +401,10 @@ class StorageUnitData:
                 continue
             seen.add(id(value))
             size += sys.getsizeof(value)
-            if isinstance(value, PackedRoutes):
+            if isinstance(value, PackedRoutes | NibbleRoutes | NarrowInts):
                 pending.append(value.data)
+            elif isinstance(value, Arange):
+                continue
             elif isinstance(value, TensorDictBase):
                 # Projected containers must outlive the identity-based walk.
                 projections.append(value.to_dict())
@@ -739,7 +789,9 @@ class SimpleStorageUnit:
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_clear"
             ):
+                before = self.storage_data.payload_bytes
                 self.storage_data.clear(global_indexes)
+            self._release_free_memory(before - self.storage_data.payload_bytes)
 
             response_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.CLEAR_DATA_RESPONSE,  # type: ignore[arg-type]
@@ -756,6 +808,24 @@ class SimpleStorageUnit:
                 },
             )
         return response_msg
+
+    def _release_free_memory(self, released: int) -> None:
+        """Trim the allocator once a tenth of the held payload (at least 1 GiB) has been cleared.
+
+        The trim runs beside the request loop; a clear that lands while one runs is
+        counted toward the next.
+        """
+        self._released_since_trim = getattr(self, "_released_since_trim", 0) + released
+        threshold = max(_TRIM_MIN_RELEASED_BYTES, self.storage_data.payload_bytes // 10)
+        trimmer = getattr(self, "_trimmer", None)
+        if self._released_since_trim < threshold or (trimmer and trimmer.is_alive()):
+            return
+        trim = _libc_malloc_trim()
+        if trim is None:
+            return
+        self._released_since_trim = 0
+        self._trimmer = Thread(target=trim, args=(0,), name="StorageMallocTrim", daemon=True)
+        self._trimmer.start()
 
     def _handle_get_metrics(self, *, route_stats: bool = False) -> ZMQMessage:
         """Handle GET_METRICS request by returning storage unit statistics.
@@ -973,6 +1043,9 @@ class SimpleStorageUnit:
                 if retained:
                     candidate[field_name] = retained
             active_keys = set().union(*(values.keys() for values in candidate.values()))
+            # Snapshots written before rows owned their storage restore each row with a
+            # private copy of its whole batch.
+            candidate = {name: {key: _owned_row(row) for key, row in rows.items()} for name, rows in candidate.items()}
             self.storage_data.replace(pack_route_fields(candidate), active_keys)
 
             logger.info(
