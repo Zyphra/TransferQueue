@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ctypes
 import hashlib
 import os
 import pickle
@@ -55,6 +56,19 @@ logger = get_logger(__name__)
 TQ_STORAGE_POLLER_TIMEOUT = int(os.environ.get("TQ_STORAGE_POLLER_TIMEOUT", 5))  # in seconds
 TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
 _CHECKPOINT_MAGIC = b"TQZSTD1\0"
+# glibc keeps freed row frames in its arenas, so RSS stays at its high-water mark
+# after rows drain. Large releases return those pages; other C libraries skip this.
+_TRIM_MIN_RELEASED_BYTES = 1 << 30
+
+
+def _libc_malloc_trim():
+    # Looked up per call: a ctypes function at module scope cannot cross Ray's pickling.
+    try:
+        return ctypes.CDLL("libc.so.6").malloc_trim
+    except (OSError, AttributeError):
+        return None
+
+
 _CHECKPOINT_HEADER_SIZE = len(_CHECKPOINT_MAGIC) + 8 + 32
 
 
@@ -739,7 +753,9 @@ class SimpleStorageUnit:
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_clear"
             ):
+                before = self.storage_data.payload_bytes
                 self.storage_data.clear(global_indexes)
+            self._release_free_memory(before - self.storage_data.payload_bytes)
 
             response_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.CLEAR_DATA_RESPONSE,  # type: ignore[arg-type]
@@ -756,6 +772,24 @@ class SimpleStorageUnit:
                 },
             )
         return response_msg
+
+    def _release_free_memory(self, released: int) -> None:
+        """Trim the allocator once a tenth of the held payload (at least 1 GiB) has been cleared.
+
+        The trim runs beside the request loop; a clear that lands while one runs is
+        counted toward the next.
+        """
+        self._released_since_trim = getattr(self, "_released_since_trim", 0) + released
+        threshold = max(_TRIM_MIN_RELEASED_BYTES, self.storage_data.payload_bytes // 10)
+        trimmer = getattr(self, "_trimmer", None)
+        if self._released_since_trim < threshold or (trimmer and trimmer.is_alive()):
+            return
+        trim = _libc_malloc_trim()
+        if trim is None:
+            return
+        self._released_since_trim = 0
+        self._trimmer = Thread(target=trim, args=(0,), name="StorageMallocTrim", daemon=True)
+        self._trimmer.start()
 
     def _handle_get_metrics(self, *, route_stats: bool = False) -> ZMQMessage:
         """Handle GET_METRICS request by returning storage unit statistics.
