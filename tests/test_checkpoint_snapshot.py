@@ -383,7 +383,8 @@ def test_two_unit_mixed_budget_fallback_waits_for_detached_writer(two_units, tmp
     from concurrent.futures import ThreadPoolExecutor
 
     tq = two_units
-    values = [torch.arange(12), torch.arange(3072)]
+    # The large value is neither a range nor narrowable, so it keeps 24 KiB of int64 storage.
+    values = [torch.arange(12), torch.arange(3072) * 7 + (1 << 40)]
     gates = [tmp_path / "small", tmp_path / "large"]
     for index, value in enumerate(values):
         tq.kv_put(key=f"row{index}", partition_id="two-su", fields={"tokens": value})

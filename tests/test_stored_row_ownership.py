@@ -34,7 +34,8 @@ def batch():
     torch.manual_seed(0)
     return TensorDict(
         {
-            "input_ids": torch.randint(0, 50_000, (ROWS, TOKENS)),
+            # Values beyond int32 keep int64 storage, so the codec leaves these rows as plain tensors.
+            "input_ids": torch.randint(1 << 40, (1 << 40) + 50_000, (ROWS, TOKENS)),
             "log_probs": torch.randn(ROWS, TOKENS),
             "routed_experts": torch.randint(0, 64, (ROWS, TOKENS, 4), dtype=torch.int16),
         },
@@ -79,7 +80,7 @@ def test_batched_put_stores_owning_rows_with_identical_bytes():
 
 
 def test_owning_rows_are_stored_without_a_copy():
-    rows = [torch.arange(TOKENS) + index for index in range(3)]
+    rows = [torch.arange(TOKENS) * 3 + (1 << 40) + index for index in range(3)]
     data = StorageUnitData(8)
     data.put_data({"input_ids": rows}, [0, 1, 2])
     assert all(data.field_data["input_ids"][index] is row for index, row in enumerate(rows))

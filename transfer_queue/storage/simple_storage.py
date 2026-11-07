@@ -15,6 +15,7 @@
 
 import ctypes
 import hashlib
+import math
 import os
 import pickle
 import sys
@@ -37,7 +38,16 @@ from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
-from transfer_queue.utils.route_codec import PackedRoutes, pack_route_fields, packable_route_ids
+from transfer_queue.utils.route_codec import (
+    Arange,
+    NarrowInts,
+    NibbleRoutes,
+    PackedRoutes,
+    compact_row,
+    pack_route_fields,
+    packable_route_ids,
+    restore_row,
+)
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -162,7 +172,9 @@ def _payload_bytes(value) -> int | None:
     Sizes follow the capture walk below, except that tensor and array storage is
     counted once per value, so shared storage is over-counted.
     """
-    if isinstance(value, PackedRoutes):
+    if isinstance(value, Arange):
+        return sys.getsizeof(value)
+    if isinstance(value, PackedRoutes | NibbleRoutes | NarrowInts):
         value = value.data
     if type(value) is torch.Tensor:
         if value.device.type != "cpu" or value.layout != torch.strided or value.is_nested:
@@ -239,6 +251,7 @@ class StorageUnitData:
         stats: dict[str, Any] = dict(
             row_count=0,
             packed_rows=0,
+            nibble_rows=0,
             unpacked_rows=0,
             unknown_rows=0,
             logical_view_bytes_known=0,
@@ -249,6 +262,11 @@ class StorageUnitData:
         stores = set()
         for value in self.field_data.get("routed_experts", {}).values():
             stats["row_count"] += 1
+            if isinstance(value, NibbleRoutes):
+                stats["nibble_rows"] += 1
+                stats["stored_view_bytes_known"] += value.data.nbytes
+                stats["logical_view_bytes_known"] += 2 * math.prod(value.shape)
+                continue
             packed = isinstance(value, PackedRoutes)
             tensor = value.data if packed else value
             if (
@@ -291,11 +309,9 @@ class StorageUnitData:
                     f"StorageUnitData get_data: field '{field}' not found. Available: {list(self.field_data.keys())}"
                 )
             try:
-                result[field] = [self.field_data[field][k] for k in global_indexes]
-                if not packed_routes:
-                    result[field] = [
-                        value.restore() if isinstance(value, PackedRoutes) else value for value in result[field]
-                    ]
+                result[field] = [
+                    restore_row(self.field_data[field][k], packed_routes=packed_routes) for k in global_indexes
+                ]
             except KeyError as e:
                 raise KeyError(f"StorageUnitData get_data: key {e} not found in field '{field}'") from e
         return result
@@ -325,7 +341,7 @@ class StorageUnitData:
                 self.field_data[f] = {}
             field_dict = self.field_data[f]
             for key, val in zip(global_indexes, values, strict=True):
-                val = _owned_row(val)
+                val = compact_row(_owned_row(val))
                 if key in field_dict:
                     self._account(field_dict[key], -1)
                 self._account(val, 1)
@@ -349,8 +365,9 @@ class StorageUnitData:
         self.field_data, self._active_keys = field_data, active_keys
         self.payload_bytes = self.unaccounted_values = 0
         for rows in field_data.values():
-            for value in rows.values():
-                self._account(value, 1)
+            for key, value in rows.items():
+                rows[key] = compact_row(value)
+                self._account(rows[key], 1)
 
     def _account(self, value, sign: int) -> None:
         size = _payload_bytes(value)
@@ -384,8 +401,10 @@ class StorageUnitData:
                 continue
             seen.add(id(value))
             size += sys.getsizeof(value)
-            if isinstance(value, PackedRoutes):
+            if isinstance(value, PackedRoutes | NibbleRoutes | NarrowInts):
                 pending.append(value.data)
+            elif isinstance(value, Arange):
+                continue
             elif isinstance(value, TensorDictBase):
                 # Projected containers must outlive the identity-based walk.
                 projections.append(value.to_dict())
