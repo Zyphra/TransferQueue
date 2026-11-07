@@ -189,6 +189,22 @@ def _payload_bytes(value) -> int | None:
     return total
 
 
+def _owned_row(value):
+    """Copy a row view out of its batch storage.
+
+    A row of a batched put shares the whole batch's storage: one surviving row keeps
+    every sibling's bytes resident, and pickling the row writes the entire storage.
+    """
+    if (
+        type(value) is torch.Tensor
+        and value.layout == torch.strided
+        and not value.is_nested
+        and value.untyped_storage().nbytes() > value.numel() * value.element_size()
+    ):
+        return value.clone()
+    return value
+
+
 class StorageUnitData:
     """Storage unit for managing 2D data structure (samples × fields).
 
@@ -309,6 +325,7 @@ class StorageUnitData:
                 self.field_data[f] = {}
             field_dict = self.field_data[f]
             for key, val in zip(global_indexes, values, strict=True):
+                val = _owned_row(val)
                 if key in field_dict:
                     self._account(field_dict[key], -1)
                 self._account(val, 1)
@@ -1007,6 +1024,9 @@ class SimpleStorageUnit:
                 if retained:
                     candidate[field_name] = retained
             active_keys = set().union(*(values.keys() for values in candidate.values()))
+            # Snapshots written before rows owned their storage restore each row with a
+            # private copy of its whole batch.
+            candidate = {name: {key: _owned_row(row) for key, row in rows.items()} for name, rows in candidate.items()}
             self.storage_data.replace(pack_route_fields(candidate), active_keys)
 
             logger.info(
