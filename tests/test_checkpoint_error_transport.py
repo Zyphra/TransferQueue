@@ -66,8 +66,7 @@ class CheckpointOwner:
         )
 
         def controller(path, **kwargs):
-            Path(path).write_bytes(b"native-controller-cut")
-            return {"indexes": []}
+            return {"indexes": [], "state": b"native-controller-cut"}
 
         def storage(path, *, phase, **kwargs):
             if phase == "prepare":

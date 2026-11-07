@@ -142,6 +142,39 @@ def _read_storage_checkpoint(path):
         return state
 
 
+def _payload_bytes(value) -> int | None:
+    """Bytes a stored value keeps alive, or None when its ownership cannot be accounted.
+
+    Sizes follow the capture walk below, except that tensor and array storage is
+    counted once per value, so shared storage is over-counted.
+    """
+    if isinstance(value, PackedRoutes):
+        value = value.data
+    if type(value) is torch.Tensor:
+        if value.device.type != "cpu" or value.layout != torch.strided or value.is_nested:
+            return None
+        return sys.getsizeof(value) + value.untyped_storage().nbytes() + 4096
+    if type(value) is np.ndarray:
+        return None if value.dtype.hasobject else value.nbytes
+    if isinstance(value, TensorDictBase):
+        value = value.to_dict()
+    if type(value) is dict:
+        items = [*value.keys(), *value.values()]
+    elif type(value) in (list, tuple, set, frozenset):
+        items = value
+    elif type(value) in (str, bytes, bytearray, int, float, bool, type(None)):
+        return sys.getsizeof(value)
+    else:
+        return None
+    total = sys.getsizeof(value)
+    for item in items:
+        size = _payload_bytes(item)
+        if size is None:
+            return None
+        total += size
+    return total
+
+
 class StorageUnitData:
     """Storage unit for managing 2D data structure (samples × fields).
 
@@ -162,6 +195,10 @@ class StorageUnitData:
         self.storage_size = storage_size
         # Track active global_index keys for O(1) capacity checks
         self._active_keys: set = set()
+        # Bytes of stored values, accounted as they are put and cleared, and the
+        # number of stored values whose ownership cannot be accounted.
+        self.payload_bytes = 0
+        self.unaccounted_values = 0
 
     @property
     def active_key_count(self) -> int:
@@ -258,6 +295,9 @@ class StorageUnitData:
                 self.field_data[f] = {}
             field_dict = self.field_data[f]
             for key, val in zip(global_indexes, values, strict=True):
+                if key in field_dict:
+                    self._account(field_dict[key], -1)
+                self._account(val, 1)
                 field_dict[key] = val
         self._active_keys.update(global_indexes)
 
@@ -269,13 +309,33 @@ class StorageUnitData:
         """
         for f in self.field_data:
             for key in keys:
-                self.field_data[f].pop(key, None)
+                if key in self.field_data[f]:
+                    self._account(self.field_data[f].pop(key), -1)
         self._active_keys -= set(keys)
 
-    def checkpoint_snapshot(self, indexes: set[int]) -> tuple[dict, int | None]:
+    def replace(self, field_data: dict[str, dict], active_keys: set) -> None:
+        """Install restored field maps and account their payloads."""
+        self.field_data, self._active_keys = field_data, active_keys
+        self.payload_bytes = self.unaccounted_values = 0
+        for rows in field_data.values():
+            for value in rows.values():
+                self._account(value, 1)
+
+    def _account(self, value, sign: int) -> None:
+        size = _payload_bytes(value)
+        if size is None:
+            self.unaccounted_values += sign
+        else:
+            self.payload_bytes += sign * size
+
+    def checkpoint_snapshot(self, indexes: set[int], max_bytes: int | None = None) -> tuple[dict, int | None]:
         """Retain replace-only values without retaining the live field maps.
 
-        Count full backing stores, including tensor views. Unknown object ownership
+        A capture cannot retain more payload than the unit holds. Payloads are
+        accounted when they are put; when every stored value was accountable and the
+        total fits ``max_bytes``, report it instead of walking every payload object,
+        so the cut costs one map copy per field. Otherwise count
+        full backing stores, including tensor views; unknown object ownership
         selects the synchronous path instead of guessing a retention budget.
         """
         fields = {
@@ -283,6 +343,8 @@ class StorageUnitData:
             for name, rows in self.field_data.items()
         }
         active = self._active_keys & indexes
+        if max_bytes is not None and not self.unaccounted_values and self.payload_bytes <= max_bytes:
+            return {"field_data": fields, "active_keys": active}, self.payload_bytes
         stores: set[tuple[int, int] | int] = set()
         pending, seen, size, projections = [fields, active], set(), 0, []
         while pending:
@@ -799,7 +861,9 @@ class SimpleStorageUnit:
             }
             retained_bytes = None
             if phase == "prepare":
-                detached, retained_bytes = self.storage_data.checkpoint_snapshot(set(data_parts.body["indexes"]))
+                detached, retained_bytes = self.storage_data.checkpoint_snapshot(
+                    set(data_parts.body["indexes"]), max_bytes=data_parts.body["max_snapshot_bytes"]
+                )
                 state.update(detached)
             elif phase != "save":
                 raise ValueError("unknown checkpoint phase")
@@ -909,8 +973,7 @@ class SimpleStorageUnit:
                 if retained:
                     candidate[field_name] = retained
             active_keys = set().union(*(values.keys() for values in candidate.values()))
-            self.storage_data.field_data = pack_route_fields(candidate)
-            self.storage_data._active_keys = active_keys
+            self.storage_data.replace(pack_route_fields(candidate), active_keys)
 
             logger.info(
                 f"[{self.storage_unit_id}]: loaded checkpoint from {path} — "

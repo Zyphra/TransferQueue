@@ -86,8 +86,9 @@ def install_client(monkeypatch, *, fallback=False, invalid_receipt=False, gate=N
         manager.storage_unit_infos["unit-0"].ip = "invalid"
 
     def controller(path, **kwargs):
-        Path(path).write_bytes(b"existing-controller-cut")
-        return {"indexes": [3]}
+        # A detached cut returns the serialized controller state for the save's writer.
+        assert kwargs == {"frontier": True}
+        return {"indexes": [3], "state": b"existing-controller-cut"}
 
     def storage(path, **kwargs):
         if kwargs["phase"] == "status" and gate is not None:
