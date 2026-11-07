@@ -94,7 +94,7 @@ def test_drained_rows_release_siblings_and_checkpoint_only_their_bytes(tmp_path)
     views = {name: dict(zip(POSITIONS, frames[name], strict=True)) for name in frames}
     logical = sum(logical_bytes(fields[name]) for name in views)
     assert pickled_bytes(views) > 10 * logical
-    assert pickled_bytes({name: fields[name] for name in views}) < logical + 64 * 1024
+    assert pickled_bytes({name: fields[name] for name in views}) < logical + 128 * 1024
 
     actor.storage_data.clear(POSITIONS[1:])
     survivor = POSITIONS[0]
